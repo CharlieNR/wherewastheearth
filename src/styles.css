@@ -196,6 +196,11 @@ button { color: inherit; }
   font-weight: 900;
   letter-spacing: .04em;
 }
+
+.terminal-test-button { border-color: #ffffff !important; }
+.terminal-test-button:disabled { cursor: wait; opacity: .65; }
+.terminal-test-button:not(:disabled) { box-shadow: 0 0 0 1px rgba(217,245,200,.25); }
+
 .terminal-tools button:hover,
 .terminal-tools button:focus-visible {
   background: #d9f5c8;
