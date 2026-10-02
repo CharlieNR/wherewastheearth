@@ -149,27 +149,49 @@ function sleep(ms) {
 async function fetchWithTimeout(url, options = {}) {
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), FRAME_REQUEST_TIMEOUT_MS);
-  const combinedSignal = options.signal;
   let abortHandler;
 
-  if (combinedSignal) {
-    if (combinedSignal.aborted) {
+  if (options.signal) {
+    if (options.signal.aborted) {
       controller.abort();
     } else {
       abortHandler = () => controller.abort();
-      combinedSignal.addEventListener('abort', abortHandler, { once: true });
+      options.signal.addEventListener('abort', abortHandler, { once: true });
     }
   }
 
   try {
     return await fetch(url, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (controller.signal.aborted && !options.signal?.aborted) {
+      const timeoutError = new Error('Frame request timed out after ' + Math.round(FRAME_REQUEST_TIMEOUT_MS / 1000) + ' seconds');
+      timeoutError.name = 'TimeoutError';
+      throw timeoutError;
+    }
+    throw error;
   } finally {
     window.clearTimeout(timeout);
-    if (combinedSignal && abortHandler) combinedSignal.removeEventListener('abort', abortHandler);
+    if (options.signal && abortHandler) options.signal.removeEventListener('abort', abortHandler);
   }
 }
 
 async function fetchReconstructionWithRetry(age, baseLand, signal) {
+  let lastError;
+  for (let attempt = 1; attempt <= FRAME_REQUEST_RETRIES; attempt += 1) {
+    if (signal?.aborted) throw new DOMException('Request aborted', 'AbortError');
+    try {
+      return await fetchReconstructionFrame(age, baseLand, signal);
+    } catch (error) {
+      lastError = error;
+      if (error?.name === 'AbortError' && signal?.aborted) throw error;
+      console.warn('Frame ' + shortAge(age) + ' attempt ' + attempt + '/' + FRAME_REQUEST_RETRIES + ' failed.', error);
+      if (attempt < FRAME_REQUEST_RETRIES) await sleep(250 * attempt);
+    }
+  }
+  throw lastError || new Error('Frame request failed');
+}
+
+
   let lastError;
   for (let attempt = 1; attempt <= FRAME_REQUEST_RETRIES; attempt += 1) {
     if (signal?.aborted) throw new DOMException('Request aborted', 'AbortError');
@@ -336,6 +358,7 @@ function App() {
       missing.sort((a, b) => a - b);
       let cursor = 0;
       const retryQueue = [];
+      const retryCounts = new Map();
       const ordered = [...missing].sort((a, b) => {
         const aPriority = a <= PRIORITY_PRELOAD_COUNT * FRAME_STEP ? 0 : 1;
         const bPriority = b <= PRIORITY_PRELOAD_COUNT * FRAME_STEP ? 0 : 1;
@@ -374,12 +397,14 @@ function App() {
             cached += 1;
             setCacheProgress({ cached: Math.min(cached, FRAME_AGES.length), total: FRAME_AGES.length });
           } catch (error) {
-            if (error?.name === 'AbortError' && !cancelled && generation === cacheGenerationRef.current) {
-              retryQueue.push(frameAge);
-            } else if (error?.name !== 'AbortError') {
-              console.warn('Background frame preload failed for ' + shortAge(frameAge), error);
-              // Retry once more later rather than losing the frame from the cache.
-              retryQueue.push(frameAge);
+            if (!cancelled && generation === cacheGenerationRef.current) {
+              const attempts = (retryCounts.get(frameAge) || 0) + 1;
+              retryCounts.set(frameAge, attempts);
+              if (attempts <= FRAME_REQUEST_RETRIES) {
+                retryQueue.push(frameAge);
+              } else {
+                console.warn('Skipping ' + shortAge(frameAge) + ' after ' + attempts + ' failed preload attempts.', error);
+              }
             }
           } finally {
             preloadControllersRef.current.delete(preloadController);
