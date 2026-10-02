@@ -457,7 +457,7 @@ function App() {
             polygonSideColor={() => period.ma === 0 ? 'rgba(88, 152, 107, 0.14)' : 'rgba(145, 104, 61, 0.16)'}
             polygonStrokeColor={() => 'rgba(244, 246, 232, 0.22)'}
             polygonLabel={() => '<div class="globe-tooltip"><strong>Reconstructed land</strong><br/><span>' + ageLabel(age) + '</span></div>'}
-            polygonTransitionDuration={reducedMotion ? 0 : 700}
+            polygonTransitionDuration={reducedMotion ? 0 : isPlaying ? 160 : 700}
             pathsData={plateMode ? PLATE_BOUNDARIES : []}
             pathPoints={(path) => path.points}
             pathPointLat={(point) => point[1]}
