@@ -8,6 +8,7 @@ import './styles.css';
 const WORLD_URL = 'https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json';
 const GPLATES_URL = 'https://gws.gplates.org/reconstruct/reconstruct_feature_collection';
 const GPLATES_COASTLINES_URL = 'https://gws.gplates.org/reconstruct/coastlines/';
+const GPLATES_COUNTRY_URL = 'https://gws.gplates.org/reconstruct/reconstruct_feature_collection';
 const GPLATES_TEST_AGE = 100;
 
 const DAY_TEXTURE = 'https://unpkg.com/three-globe/example/img/earth-blue-marble.jpg';
@@ -409,6 +410,114 @@ function modelForAge(age) {
   return 'CAO2024';
 }
 
+function countryKey(country) {
+  return String(country?.id || country?.properties?.name || 'unknown');
+}
+
+function countryCacheKey(country, age) {
+  return 'country:' + countryKey(country) + ':' + modelForAge(age) + ':' + String(Math.round(age));
+}
+
+function featureCentroid(feature) {
+  const points = [];
+  const collect = (value) => {
+    if (!Array.isArray(value)) return;
+    if (value.length >= 2 && typeof value[0] === 'number' && typeof value[1] === 'number') {
+      points.push(value);
+      return;
+    }
+    value.forEach(collect);
+  };
+  collect(feature?.geometry?.coordinates);
+  if (!points.length) return { lat: 0, lng: 0 };
+  const lng = points.reduce((sum, point) => sum + point[0], 0) / points.length;
+  const lat = points.reduce((sum, point) => sum + point[1], 0) / points.length;
+  return { lat, lng };
+}
+
+async function fetchCountryReconstructionWithRetry(country, age, signal) {
+  let lastError;
+  for (let attempt = 1; attempt <= FRAME_REQUEST_RETRIES; attempt += 1) {
+    if (signal?.aborted) throw new DOMException('Request aborted', 'AbortError');
+    diagnostic('info', 'COUNTRY', 'Tracking reconstruction attempt ' + attempt + '/' + FRAME_REQUEST_RETRIES, {
+      country: country?.properties?.name,
+      id: countryKey(country),
+      age,
+      model: modelForAge(age),
+    });
+    try {
+      const featureCollection = {
+        type: 'FeatureCollection',
+        features: [{
+          type: 'Feature',
+          id: country?.id,
+          properties: { name: country?.properties?.name || countryKey(country) },
+          geometry: country.geometry,
+        }],
+      };
+      const payload = new URLSearchParams();
+      payload.set('feature_collection', JSON.stringify(featureCollection));
+      payload.set('time', String(age));
+      payload.set('model', modelForAge(age));
+      payload.set('anchor_plate_id', '0');
+
+      diagnostic('info', 'COUNTRY', 'Tracking request start', {
+        country: country?.properties?.name,
+        age,
+        payloadBytes: payload.toString().length,
+      });
+
+      const response = await fetchWithTimeout(GPLATES_COUNTRY_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+          Accept: 'application/geo+json, application/json;q=0.9',
+        },
+        body: payload,
+        signal,
+      });
+      const textBody = await response.text();
+      diagnostic(response.ok ? 'info' : 'error', 'COUNTRY', 'Tracking response received', {
+        country: country?.properties?.name,
+        age,
+        status: response.status,
+        bytes: textBody.length,
+      });
+      if (!response.ok) throw new Error('GPlates country HTTP ' + response.status + ': ' + textBody.slice(0, 250));
+
+      const reconstructed = JSON.parse(textBody);
+      const features = flattenFeatures(reconstructed)
+        .filter((feature) => feature.geometry)
+        .map((feature) => ({
+          type: 'Feature',
+          properties: { trackedCountry: country?.properties?.name || countryKey(country) },
+          geometry: feature.geometry,
+          __layer: 'tracked',
+        }));
+
+      if (!features.length) throw new Error('No reconstructed country geometry returned');
+      diagnostic('info', 'COUNTRY', 'Tracking reconstruction complete', {
+        country: country?.properties?.name,
+        age,
+        features: features.length,
+      });
+      return features;
+    } catch (error) {
+      lastError = error;
+      if (error?.name === 'AbortError' && signal?.aborted) throw error;
+      diagnostic('warn', 'COUNTRY', 'Tracking attempt failed', {
+        country: country?.properties?.name,
+        age,
+        attempt,
+        name: error?.name,
+        message: error?.message,
+      });
+      if (attempt < FRAME_REQUEST_RETRIES) await sleep(250 * attempt);
+    }
+  }
+  throw lastError || new Error('Country tracking request failed');
+}
+
 function ageLabel(age) {
   if (age < 0.05) return 'Present day';
   if (age < 1000) return age.toFixed(age < 10 ? 1 : 0) + ' million years ago';
@@ -454,7 +563,11 @@ function App() {
   const [direction, setDirection] = useState('Start exploring');
   const [land, setLand] = useState([]);
   const [baseLand, setBaseLand] = useState(null);
+  const [countries, setCountries] = useState([]);
   const [countryBoundaries, setCountryBoundaries] = useState([]);
+  const [countrySearch, setCountrySearch] = useState('');
+  const [trackedCountry, setTrackedCountry] = useState(null);
+  const [trackedCountryLand, setTrackedCountryLand] = useState([]);
   const [status, setStatus] = useState('loading');
   const [statusText, setStatusText] = useState('Preparing Earth…');
   const [selected, setSelected] = useState({
@@ -472,6 +585,8 @@ function App() {
   const frameCacheRef = useRef(new Map());
   const preloadControllersRef = useRef(new Set());
   const playbackPreloadControllerRef = useRef(null);
+  const trackedCountryCacheRef = useRef(new Map());
+  const trackedCountryRequestRef = useRef(0);
   const foregroundRequestRef = useRef(0);
   const foregroundLoadingRef = useRef(false);
   const cacheGenerationRef = useRef(0);
@@ -517,9 +632,22 @@ function App() {
   const keyframeAge = useMemo(() => keyframeAgeFor(age), [age]);
   const visibleEvents = useMemo(() => EVENTS.filter((event) => Math.abs(event.ma - age) < 95), [age]);
   const globePaths = useMemo(() => [
-    ...(age < 0.1 ? countryBoundaries : []),
+    ...countryBoundaries.map((path) => ({ ...path, age })),
     ...(plateMode ? PLATE_BOUNDARIES.map((path) => ({ kind: 'plate', ...path })) : []),
   ], [age, countryBoundaries, plateMode]);
+
+  const countryResults = useMemo(() => {
+    const query = countrySearch.trim().toLowerCase();
+    if (!query) return [];
+    return countries
+      .filter((country) => (country.properties?.name || '').toLowerCase().includes(query))
+      .slice(0, 8);
+  }, [countrySearch, countries]);
+
+  const globePolygons = useMemo(() => [
+    ...land.map((feature) => ({ ...feature, __layer: 'land' })),
+    ...trackedCountryLand.map((feature) => ({ ...feature, __layer: 'tracked' })),
+  ], [land, trackedCountryLand]);
 
   const results = useMemo(() => {
     const query = search.trim().toLowerCase();
@@ -548,17 +676,22 @@ function App() {
         if (!response.ok) throw new Error('World data unavailable');
         const topology = await response.json();
         const feature = topojson.feature(topology, topology.objects.land);
+        const countryFeatures = topology.objects.countries
+          ? flattenFeatures(topojson.feature(topology, topology.objects.countries))
+          : [];
         const countryMesh = topology.objects.countries
           ? topojson.mesh(topology, topology.objects.countries, (a, b) => a !== b)
           : null;
         if (cancelled) return;
         setBaseLand(feature);
         setLand(flattenFeatures(feature));
+        setCountries(countryFeatures);
         const boundaries = meshToPaths(countryMesh);
         setCountryBoundaries(boundaries);
         diagnostic('info', 'WORLD', 'World atlas loaded', {
           geometryType: flattenFeatures(feature)[0]?.geometry?.type,
           featureCount: flattenFeatures(feature).length,
+          countryFeatureCount: countryFeatures.length,
           countryBoundaryPathCount: boundaries.length,
         });
         setStatus('ready');
@@ -763,6 +896,73 @@ function App() {
   }, [keyframeAge, baseLand, isPlaying, reducedMotion]);
 
   useEffect(() => {
+    trackedCountryRequestRef.current += 1;
+    const requestId = trackedCountryRequestRef.current;
+    const controller = new AbortController();
+
+    if (!trackedCountry) {
+      setTrackedCountryLand([]);
+      return () => controller.abort();
+    }
+
+    const targetAge = keyframeAge;
+    const name = trackedCountry.properties?.name || countryKey(trackedCountry);
+    diagnostic('info', 'COUNTRY', 'Tracking country selected', {
+      country: name,
+      id: countryKey(trackedCountry),
+      age,
+      keyframe: targetAge,
+    });
+
+    const load = async () => {
+      try {
+        if (age < 0.1) {
+          setTrackedCountryLand([{
+            ...trackedCountry,
+            properties: { ...(trackedCountry.properties || {}), trackedCountry: name },
+            __layer: 'tracked',
+          }]);
+          diagnostic('info', 'COUNTRY', 'Using exact present-day country geometry', { country: name });
+          return;
+        }
+
+        const cacheKey = countryCacheKey(trackedCountry, targetAge);
+        let features = trackedCountryCacheRef.current.get(cacheKey);
+
+        if (!features) {
+          const cached = await getStoredFrame(cacheKey);
+          if (cached?.length) features = cached;
+        }
+
+        if (!features) {
+          features = await fetchCountryReconstructionWithRetry(trackedCountry, targetAge, controller.signal);
+          if (controller.signal.aborted || requestId !== trackedCountryRequestRef.current) return;
+          trackedCountryCacheRef.current.set(cacheKey, features);
+        }
+
+        if (requestId !== trackedCountryRequestRef.current) return;
+        trackedCountryCacheRef.current.set(cacheKey, features);
+        setTrackedCountryLand(features);
+        diagnostic('info', 'COUNTRY', 'Tracked country geometry displayed', {
+          country: name,
+          age: targetAge,
+          features: features.length,
+        });
+      } catch (error) {
+        if (requestId !== trackedCountryRequestRef.current || error?.name === 'AbortError') return;
+        diagnostic('warn', 'COUNTRY', 'Tracked country reconstruction unavailable; keeping last geometry', {
+          country: name,
+          age: targetAge,
+          message: error?.message,
+        });
+      }
+    };
+
+    load();
+    return () => controller.abort();
+  }, [trackedCountry, keyframeAge, age]);
+
+  useEffect(() => {
     if (!globeRef.current) return;
     const controls = globeRef.current.controls();
     controls.autoRotate = autoRotate;
@@ -862,6 +1062,11 @@ function App() {
       setIsResettingCache(false);
       setCacheGeneration((value) => value + 1);
       setLand(flattenFeatures(baseLand));
+      setTrackedCountryLand(trackedCountry ? [{
+        ...trackedCountry,
+        properties: { ...(trackedCountry.properties || {}), trackedCountry: trackedCountry.properties?.name || countryKey(trackedCountry) },
+        __layer: 'tracked',
+      }] : []);
       setAge(0);
     }
   };
@@ -895,6 +1100,30 @@ function App() {
     setAge(event.ma);
     focus(event.lat, event.lng, 1.75);
     setSelected({ kind: 'event', title: event.name, kicker: event.tag + ' · ' + shortAge(event.ma), summary: event.summary, body: 'This marker is intended as a discovery prompt. The model and age are approximate where the underlying geology is uncertain.' });
+  };
+
+  const selectCountry = (country) => {
+    const name = country.properties?.name || countryKey(country);
+    const centroid = featureCentroid(country);
+    setTrackedCountry(country);
+    setCountrySearch('');
+    setSelected({
+      kind: 'country',
+      title: name,
+      kicker: 'Tracking · modern country geography',
+      summary: 'The pink land shows where the territory represented by this present-day country reconstructs through geological time.',
+      body: 'In the past, the country outline becomes a model-based reconstruction of the selected present-day territory. Other country boundaries remain as a faint modern-day wireframe reference.',
+    });
+    focus(centroid.lat, centroid.lng, 1.55);
+    diagnostic('info', 'COUNTRY', 'Country tracking enabled', { country: name, id: countryKey(country) });
+  };
+
+  const clearTrackedCountry = () => {
+    if (trackedCountry) {
+      diagnostic('info', 'COUNTRY', 'Country tracking disabled', { country: trackedCountry.properties?.name || countryKey(trackedCountry) });
+    }
+    setTrackedCountry(null);
+    setTrackedCountryLand([]);
   };
 
   const handleAge = (value) => {
@@ -1033,21 +1262,31 @@ function App() {
             showAtmosphere
             atmosphereColor="#6fd3a8"
             atmosphereAltitude={0.17}
-            polygonsData={land}
+            polygonsData={globePolygons}
             polygonGeoJsonGeometry={(feature) => feature.geometry}
-            polygonAltitude={0.01}
-            polygonCapColor={() => period.ma === 0 ? '#d8e8b8' : '#c5d6a0'}
-            polygonSideColor={() => period.ma === 0 ? '#7e9b70' : '#718663'}
-            polygonStrokeColor={() => 'rgba(247, 255, 232, 0.72)'}
-            polygonLabel={() => '<div class="globe-tooltip"><strong>Reconstructed landmass</strong><br/><span>' + ageLabel(age) + '</span></div>'}
+            polygonAltitude={(feature) => feature.__layer === 'tracked' ? 0.016 : 0.01}
+            polygonCapColor={(feature) => {
+              if (feature.__layer === 'tracked') return '#ff5caf';
+              return age < 0.1 ? 'rgba(0,0,0,0)' : '#79985f';
+            }}
+            polygonSideColor={(feature) => {
+              if (feature.__layer === 'tracked') return '#d43f8e';
+              return age < 0.1 ? 'rgba(0,0,0,0)' : '#5d794f';
+            }}
+            polygonStrokeColor={(feature) => feature.__layer === 'tracked' ? '#ffd1ea' : age < 0.1 ? 'rgba(255,255,255,0.15)' : 'rgba(232,246,215,0.75)'}
+            polygonLabel={(feature) => feature.__layer === 'tracked'
+              ? '<div class="globe-tooltip"><strong>' + (feature.properties?.trackedCountry || 'Tracked country') + '</strong><br/><span>Tracked territory · ' + ageLabel(age) + '</span></div>'
+              : '<div class="globe-tooltip"><strong>Reconstructed landmass</strong><br/><span>' + ageLabel(age) + '</span></div>'}
             polygonTransitionDuration={reducedMotion ? 0 : isPlaying ? 850 : 500}
             pathsData={globePaths}
             pathPoints={(path) => path.points}
             pathPointLat={(point) => point[1]}
             pathPointLng={(point) => point[0]}
-            pathColor={(path) => path.kind === 'country' ? '#ffffff' : path.type === 'Divergent' ? '#78ddb5' : path.type === 'Convergent' ? '#f0ad75' : '#9ac8ff'}
-            pathStroke={(path) => path.kind === 'country' ? 1.0 : 2.1}
-            pathAltitude={(path) => path.kind === 'country' ? 0.022 : 0.03}
+            pathColor={(path) => path.kind === 'country'
+              ? (path.age < 0.1 ? 'rgba(255,255,255,0.78)' : 'rgba(231,247,239,0.28)')
+              : path.type === 'Divergent' ? '#78ddb5' : path.type === 'Convergent' ? '#f0ad75' : '#9ac8ff'}
+            pathStroke={(path) => path.kind === 'country' ? (path.age < 0.1 ? 0.95 : 0.65) : 2.1}
+            pathAltitude={(path) => path.kind === 'country' ? 0.025 : 0.03}
             pathResolution={3}
             pathDashLength={(path) => path.kind === 'country' ? 1 : (plateMode ? 0.62 : 0)}
             pathDashGap={(path) => path.kind === 'country' ? 0 : (plateMode ? 0.28 : 0)}
@@ -1112,6 +1351,49 @@ function App() {
                     <span aria-hidden="true">↗</span>
                   </button>
                 ))}
+              </div>
+            )}
+          </div>
+
+          <div className="rail-panel country-panel">
+            <div className="panel-eyebrow">Track my country</div>
+            <div className="country-search-box">
+              <span aria-hidden="true">⌕</span>
+              <input
+                value={countrySearch}
+                onChange={(event) => setCountrySearch(event.target.value)}
+                placeholder={trackedCountry ? (trackedCountry.properties?.name || 'Tracked country') : 'Search for a country…'}
+                aria-label="Search for a country to track through geological time"
+              />
+              {(countrySearch || trackedCountry) && (
+                <button type="button" onClick={() => {
+                  setCountrySearch('');
+                  if (trackedCountry) clearTrackedCountry();
+                }} aria-label="Clear country tracking">×</button>
+              )}
+            </div>
+            {countryResults.length > 0 && (
+              <div className="country-results">
+                {countryResults.map((country) => (
+                  <button key={countryKey(country)} className="country-result" type="button" onClick={() => selectCountry(country)}>
+                    <span className="country-flag" aria-hidden="true">●</span>
+                    <span>
+                      <strong>{country.properties?.name || countryKey(country)}</strong>
+                      <small>Track this territory through time</small>
+                    </span>
+                    <span aria-hidden="true">→</span>
+                  </button>
+                ))}
+              </div>
+            )}
+            {trackedCountry && (
+              <div className="tracked-country-status">
+                <span className="tracked-country-swatch" aria-hidden="true" />
+                <div>
+                  <small>TRACKING</small>
+                  <strong>{trackedCountry.properties?.name || countryKey(trackedCountry)}</strong>
+                  <span>{age < 0.1 ? 'Present-day territory highlighted' : 'Pink = reconstructed territory'}</span>
+                </div>
               </div>
             )}
           </div>
