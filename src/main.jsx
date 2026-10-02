@@ -916,7 +916,7 @@ function App() {
 
     const load = async () => {
       try {
-        if (age < 0.1) {
+        if (targetAge < 0.1) {
           setTrackedCountryLand([{
             ...trackedCountry,
             properties: { ...(trackedCountry.properties || {}), trackedCountry: name },
@@ -928,11 +928,6 @@ function App() {
 
         const cacheKey = countryCacheKey(trackedCountry, targetAge);
         let features = trackedCountryCacheRef.current.get(cacheKey);
-
-        if (!features) {
-          const cached = await getStoredFrame(cacheKey);
-          if (cached?.length) features = cached;
-        }
 
         if (!features) {
           features = await fetchCountryReconstructionWithRetry(trackedCountry, targetAge, controller.signal);
@@ -960,7 +955,7 @@ function App() {
 
     load();
     return () => controller.abort();
-  }, [trackedCountry, keyframeAge, age]);
+  }, [trackedCountry, keyframeAge]);
 
   useEffect(() => {
     if (!globeRef.current) return;
