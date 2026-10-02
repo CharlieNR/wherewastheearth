@@ -147,7 +147,10 @@ async function getStoredFrame(age) {
         resolve(null);
       }
     };
-    request.onerror = () => resolve(null);
+    request.onerror = () => {
+      diagnostic('warn', 'CACHE', 'IndexedDB key lookup failed', { key });
+      resolve(null);
+    };
   });
 }
 
@@ -236,7 +239,7 @@ async function fetchWithTimeout(url, options = {}) {
 
   try {
     const response = await fetch(url, { ...options, signal: controller.signal });
-    diagnostic('info', 'NET', 'HTTP response received', { status: response.status, ms: Math.round(performance.now() - started), url });
+    diagnostic('info', 'NET', 'HTTP response received', { status: response.status, type: response.type, ms: Math.round(performance.now() - started), url });
     return response;
   } catch (error) {
     if (controller.signal.aborted && !options.signal?.aborted) {
@@ -549,6 +552,23 @@ function App() {
     const generation = cacheGenerationRef.current;
 
     const warm = async () => {
+      const health = await testGplatesConnectivity();
+      if (!health.ok) {
+        if (!cancelled && generation === cacheGenerationRef.current) {
+          setStatus('warning');
+          setStatusText('GPlates connection unavailable · Present day remains available');
+          diagnostic('warn', 'CACHE', 'Background preload not started because GPlates health check failed', {
+            retryAfterMs: PRELOAD_FAILURE_PAUSE_MS,
+          });
+        }
+        return;
+      }
+
+      if (!cancelled && generation === cacheGenerationRef.current) {
+        setStatus('ready');
+        setStatusText('GPlates connected · building keyframe cache');
+      }
+
       diagnostic('info', 'CACHE', 'Background keyframe preload started', {
         total: KEYFRAME_AGES.length,
         workers: PRELOAD_WORKERS,
