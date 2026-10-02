@@ -7,6 +7,9 @@ import './styles.css';
 
 const WORLD_URL = 'https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json';
 const GPLATES_URL = 'https://gws.gplates.org/reconstruct/reconstruct_feature_collection';
+const GPLATES_COASTLINES_URL = 'https://gws.gplates.org/reconstruct/coastlines/';
+const GPLATES_TEST_AGE = 100;
+
 const DAY_TEXTURE = 'https://unpkg.com/three-globe/example/img/earth-blue-marble.jpg';
 const BUMP_TEXTURE = 'https://unpkg.com/three-globe/example/img/earth-topology.png';
 const STAR_TEXTURE = 'https://unpkg.com/three-globe/example/img/night-sky.png';
@@ -18,10 +21,13 @@ const MAX_AGE = 1800;
 const PLAYBACK_STEP = 5;
 const KEYFRAME_STEP = 25;
 const KEYFRAME_AGES = Array.from({ length: Math.floor(MAX_AGE / KEYFRAME_STEP) + 1 }, (_, index) => Math.min(index * KEYFRAME_STEP, MAX_AGE));
-const PRELOAD_WORKERS = 6;
+const PRELOAD_WORKERS = 2;
 const FRAME_REQUEST_TIMEOUT_MS = 30000;
 const FRAME_REQUEST_RETRIES = 3;
 const PRIORITY_KEYFRAMES = 8;
+const PRELOAD_START_DELAY_MS = 1200;
+const PRELOAD_FAILURE_PAUSE_MS = 12000;
+
 
 
 const MAX_DIAGNOSTIC_LINES = 2500;
@@ -75,13 +81,16 @@ function writeFrameManifestEntry(key) {
   }
 }
 
+let frameDbPromise = null;
+
 function openFrameDb() {
   if (!('indexedDB' in window)) {
     diagnostic('warn', 'CACHE', 'IndexedDB is unavailable; persistent frame storage disabled');
     return Promise.resolve(null);
   }
+  if (frameDbPromise) return frameDbPromise;
   diagnostic('info', 'CACHE', 'Opening IndexedDB cache', { db: CACHE_DB_NAME, store: CACHE_STORE_NAME });
-  return new Promise((resolve, reject) => {
+  frameDbPromise = new Promise((resolve, reject) => {
     const request = window.indexedDB.open(CACHE_DB_NAME, 1);
     request.onupgradeneeded = () => {
       if (!request.result.objectStoreNames.contains(CACHE_STORE_NAME)) {
@@ -89,7 +98,11 @@ function openFrameDb() {
       }
     };
     request.onsuccess = () => { diagnostic('info', 'CACHE', 'IndexedDB ready'); resolve(request.result); };
-    request.onerror = () => { diagnostic('error', 'CACHE', 'IndexedDB open failed', { message: request.error?.message || String(request.error) }); reject(request.error); };
+    request.onerror = () => {
+      frameDbPromise = null;
+      diagnostic('error', 'CACHE', 'IndexedDB open failed', { message: request.error?.message || String(request.error) });
+      reject(request.error);
+    };
   });
 }
 
@@ -240,13 +253,13 @@ async function fetchWithTimeout(url, options = {}) {
   }
 }
 
-async function fetchReconstructionWithRetry(age, baseLand, signal) {
+async function fetchReconstructionWithRetry(age, signal) {
   let lastError;
   for (let attempt = 1; attempt <= FRAME_REQUEST_RETRIES; attempt += 1) {
     if (signal?.aborted) throw new DOMException('Request aborted', 'AbortError');
-    diagnostic('info', 'FRAME', 'Attempt ' + attempt + '/' + FRAME_REQUEST_RETRIES, { age, model: modelForAge(age) });
+    diagnostic('info', 'FRAME', 'Attempt ' + attempt + '/' + FRAME_REQUEST_RETRIES, { age, model: modelForAge(age), source: 'coastlines' });
     try {
-      return await fetchReconstructionFrame(age, baseLand, signal);
+      return await fetchReconstructionFrame(age, signal);
     } catch (error) {
       lastError = error;
       if (error?.name === 'AbortError' && signal?.aborted) throw error;
@@ -257,31 +270,26 @@ async function fetchReconstructionWithRetry(age, baseLand, signal) {
   throw lastError || new Error('Frame request failed');
 }
 
-async function fetchReconstructionFrame(age, baseLand, signal) {
+async function fetchReconstructionFrame(age, signal) {
   const started = performance.now();
   const model = modelForAge(age);
-  const featureCollection = {
-    type: 'FeatureCollection',
-    features: [{ type: 'Feature', properties: {}, geometry: baseLand.geometry }],
-  };
-  const geoJson = JSON.stringify(featureCollection);
-  const payload = new URLSearchParams();
-  payload.set('feature_collection', geoJson);
-  payload.set('time', String(age));
-  payload.set('model', model);
-  payload.set('anchor_plate_id', '0');
+  const url = new URL(GPLATES_COASTLINES_URL);
+  url.searchParams.set('time', String(age));
+  url.searchParams.set('model', model);
+  url.searchParams.set('anchor_plate_id', '0');
+  url.searchParams.set('wrap', 'true');
 
   diagnostic('info', 'FRAME', 'REQUEST start', {
     age,
     model,
-    payloadBytes: payload.toString().length,
-    endpoint: GPLATES_URL,
+    method: 'GET',
+    source: 'coastlines',
+    endpoint: GPLATES_COASTLINES_URL,
   });
 
-  const response = await fetchWithTimeout(GPLATES_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
-    body: payload,
+  const response = await fetchWithTimeout(url.toString(), {
+    method: 'GET',
+    headers: { Accept: 'application/geo+json, application/json;q=0.9, text/plain;q=0.8' },
     signal,
   });
 
@@ -296,33 +304,101 @@ async function fetchReconstructionFrame(age, baseLand, signal) {
   });
 
   if (!response.ok) {
-    throw new Error('GPlates HTTP ' + response.status + ': ' + responseText.slice(0, 300));
+    throw new Error('GPlates coastline HTTP ' + response.status + ': ' + responseText.slice(0, 300));
   }
 
   let reconstructed;
   try {
     reconstructed = JSON.parse(responseText);
   } catch (error) {
-    diagnostic('error', 'FRAME', 'Response was not valid JSON', { age, model, message: error?.message });
-    throw new Error('GPlates returned invalid JSON');
+    diagnostic('error', 'FRAME', 'Coastline response was not valid JSON', { age, model, message: error?.message });
+    throw new Error('GPlates coastline endpoint returned invalid JSON');
   }
 
-  const features = flattenFeatures(reconstructed).filter((feature) => feature.geometry).map((feature) => ({
-    type: 'Feature',
-    properties: {},
-    geometry: feature.geometry,
-  }));
+  const features = flattenFeatures(reconstructed)
+    .filter((feature) => feature.geometry)
+    .map((feature) => ({
+      type: 'Feature',
+      properties: feature.properties || {},
+      geometry: feature.geometry,
+    }));
 
   diagnostic('info', 'FRAME', 'REQUEST complete', {
     age,
     model,
+    source: 'coastlines',
     features: features.length,
     ms: Math.round(performance.now() - started),
   });
 
-  if (!features.length) throw new Error('No reconstructed geometry returned');
+  if (!features.length) throw new Error('No reconstructed coastline geometry returned');
   return features;
 }
+
+async function testGplatesConnectivity() {
+  const started = performance.now();
+  const url = new URL(GPLATES_COASTLINES_URL);
+  url.searchParams.set('time', String(GPLATES_TEST_AGE));
+  url.searchParams.set('model', 'MULLER2022');
+  url.searchParams.set('anchor_plate_id', '0');
+  url.searchParams.set('extent', '-10,10,-10,10');
+  diagnostic('info', 'TEST', 'GPlates connectivity test started', {
+    method: 'GET',
+    endpoint: GPLATES_COASTLINES_URL,
+    testAge: GPLATES_TEST_AGE,
+    model: 'MULLER2022',
+  });
+
+  try {
+    const response = await fetchWithTimeout(url.toString(), {
+      method: 'GET',
+      headers: { Accept: 'application/geo+json, application/json;q=0.9, text/plain;q=0.8' },
+    });
+    const body = await response.text();
+    const ms = Math.round(performance.now() - started);
+
+    let featureCount = 0;
+    try {
+      featureCount = flattenFeatures(JSON.parse(body)).filter((feature) => feature.geometry).length;
+    } catch {
+      // The status/response body diagnostics below are still useful when parsing fails.
+    }
+
+    diagnostic(response.ok ? 'info' : 'error', 'TEST', response.ok ? 'GPlates connectivity test PASSED' : 'GPlates connectivity test returned an HTTP error', {
+      status: response.status,
+      ok: response.ok,
+      ms,
+      bytes: body.length,
+      featureCount,
+      cors: 'browser fetch completed',
+      preview: response.ok ? undefined : body.slice(0, 500),
+    });
+
+    if (!response.ok) {
+      throw new Error('HTTP ' + response.status);
+    }
+
+    return {
+      ok: true,
+      status: response.status,
+      ms,
+      bytes: body.length,
+      featureCount,
+    };
+  } catch (error) {
+    const ms = Math.round(performance.now() - started);
+    diagnostic('error', 'TEST', 'GPlates connectivity test FAILED', {
+      ms,
+      name: error?.name,
+      message: error?.message,
+      hint: error?.name === 'TypeError'
+        ? 'The browser could not complete the cross-origin GET. This usually indicates connectivity or a CORS/network restriction.'
+        : undefined,
+    });
+    return { ok: false, ms, name: error?.name, message: error?.message };
+  }
+}
+
 
 function modelForAge(age) {
   if (age <= 410) return 'MULLER2022';
@@ -390,6 +466,7 @@ function App() {
     '--- intheglobe diagnostics boot ---',
     'INFO  [SYSTEM] Terminal ready. Detailed runtime logging is enabled.',
   ]);
+  const [gplatesTestState, setGplatesTestState] = useState('idle');
   const [reducedMotion, setReducedMotion] = useState(
     window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false
   );
@@ -453,7 +530,7 @@ function App() {
         if (cancelled) return;
         setBaseLand(feature);
         setLand(flattenFeatures(feature));
-        diagnostic('info', 'WORLD', 'World atlas loaded', { geometryType: feature.geometry?.type, featureCount: flattenFeatures(feature).length });
+        diagnostic('info', 'WORLD', 'World atlas loaded', { geometryType: flattenFeatures(feature)[0]?.geometry?.type, featureCount: flattenFeatures(feature).length });
         setStatus('ready');
         setStatusText('Ready to explore');
       } catch (error) {
@@ -472,7 +549,12 @@ function App() {
     const generation = cacheGenerationRef.current;
 
     const warm = async () => {
-      diagnostic('info', 'CACHE', 'Background keyframe preload started', { total: KEYFRAME_AGES.length, workers: PRELOAD_WORKERS });
+      diagnostic('info', 'CACHE', 'Background keyframe preload started', {
+        total: KEYFRAME_AGES.length,
+        workers: PRELOAD_WORKERS,
+        startDelayMs: PRELOAD_START_DELAY_MS,
+        strategy: 'two-worker throttled coastline requests',
+      });
       const storedKeys = await getStoredFrameKeys();
       let cached = KEYFRAME_AGES.filter((frameAge) => storedKeys.has(frameKey(frameAge))).length;
       setCacheProgress({ cached, total: KEYFRAME_AGES.length });
@@ -480,6 +562,7 @@ function App() {
 
       const missing = KEYFRAME_AGES.filter((frameAge) => !storedKeys.has(frameKey(frameAge)));
       let cursor = 0;
+      let consecutiveFailures = 0;
       const retryQueue = [];
       const retryCounts = new Map();
       const ordered = [...missing].sort((a, b) => {
@@ -490,6 +573,11 @@ function App() {
 
       const worker = async () => {
         while (!cancelled && generation === cacheGenerationRef.current) {
+          if (consecutiveFailures >= PRELOAD_WORKERS) {
+            diagnostic('warn', 'CACHE', 'Background preload paused after repeated network failures', { pauseMs: PRELOAD_FAILURE_PAUSE_MS, consecutiveFailures });
+            await sleep(PRELOAD_FAILURE_PAUSE_MS);
+            consecutiveFailures = 0;
+          }
           let frameAge = retryQueue.shift();
           if (frameAge === undefined) {
             frameAge = ordered[cursor++];
@@ -510,18 +598,20 @@ function App() {
             if (!features) features = await getStoredFrame(frameAge);
 
             if (!features) {
-              features = await fetchReconstructionWithRetry(frameAge, baseLand, preloadController.signal);
+              features = await fetchReconstructionWithRetry(frameAge, preloadController.signal);
               if (cancelled || generation !== cacheGenerationRef.current) return;
               await putStoredFrame(frameAge, features);
             }
 
             if (cancelled || generation !== cacheGenerationRef.current) return;
             frameCacheRef.current.set(key, features);
+            consecutiveFailures = 0;
             cached += 1;
             diagnostic('info', 'CACHE', 'Background keyframe ready', { age: frameAge, progress: cached + '/' + KEYFRAME_AGES.length });
             setCacheProgress({ cached: Math.min(cached, KEYFRAME_AGES.length), total: KEYFRAME_AGES.length });
           } catch (error) {
             if (!cancelled && generation === cacheGenerationRef.current) {
+              if (error?.name !== 'AbortError') consecutiveFailures += 1;
               const attempts = (retryCounts.get(frameAge) || 0) + 1;
               retryCounts.set(frameAge, attempts);
               if (attempts <= FRAME_REQUEST_RETRIES) {
@@ -540,7 +630,7 @@ function App() {
     };
 
     // Start immediately; the app no longer waits for an idle callback.
-    const start = window.setTimeout(() => warm(), 80);
+    const start = window.setTimeout(() => warm(), PRELOAD_START_DELAY_MS);
 
     return () => {
       cancelled = true;
@@ -587,7 +677,7 @@ function App() {
 
         if (!features) {
           setStatusText('Loading ' + shortAge(targetAge) + ' reconstruction…');
-          features = await fetchReconstructionWithRetry(targetAge, baseLand, controller.signal);
+          features = await fetchReconstructionWithRetry(targetAge, controller.signal);
           if (currentRequest !== requestRef.current) return;
           frameCacheRef.current.set(key, features);
           await putStoredFrame(targetAge, features);
@@ -773,6 +863,16 @@ function App() {
                 <span>Current {shortAge(age)} · keyframe {shortAge(keyframeAge)} · model {modelForAge(keyframeAge)}</span>
               </div>
               <div className="terminal-tools">
+                <button
+                  type="button"
+                  className="terminal-test-button"
+                  onClick={async () => {
+                    setGplatesTestState('testing');
+                    const result = await testGplatesConnectivity();
+                    setGplatesTestState(result.ok ? 'passed' : 'failed');
+                  }}
+                  disabled={gplatesTestState === 'testing'}
+                >{gplatesTestState === 'testing' ? 'TESTING…' : gplatesTestState === 'passed' ? 'GPlates OK' : gplatesTestState === 'failed' ? 'GPlates FAIL' : 'TEST GPlATES'}</button>
                 <button type="button" onClick={async () => {
                   try {
                     if (!navigator.clipboard) throw new Error('Clipboard API unavailable');
@@ -799,7 +899,7 @@ function App() {
 
             <div className="terminal-input">
               <span>root@intheglobe:~$</span>
-              <span>Live diagnostics enabled — network, reconstruction, cache, world data, UI, and browser errors appear here.</span>
+              <span>Live diagnostics enabled — network, reconstruction, cache, world data, UI, and browser errors appear here. Use TEST GPlATES to run a direct browser connectivity check.</span>
             </div>
 
             <div className="terminal-foot">
