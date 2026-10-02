@@ -283,7 +283,7 @@ function App() {
       const missing = FRAME_AGES.filter((frameAge) => frameAge > 0 && !manifest.has(frameKey(frameAge)));
       // Prioritise the near-present sequence so playback becomes useful quickly,
       // then continue through the rest of deep time.
-      missing.sort((a, b) => Math.abs(a - age) - Math.abs(b - age));
+      missing.sort((a, b) => a - b);
       let cursor = 0;
 
       const worker = async () => {
@@ -324,7 +324,7 @@ function App() {
       cancelled = true;
       window.clearTimeout(start);
     };
-  }, [baseLand, cacheGeneration, age]);
+  }, [baseLand, cacheGeneration]);
 
   useEffect(() => {
     if (!baseLand || status === 'error') return;
@@ -609,7 +609,7 @@ function App() {
           <input type="range" min="0" max={MAX_AGE} step="1" value={age} onChange={(event) => handleAge(event.target.value)} aria-label="Travel through geological time" />
           <div className="timeline-track" aria-hidden="true">
             {EVENTS.map((event) => (
-              <button key={event.id} className="timeline-event" style={{ left: (event.ma / 1800 * 100) + '%' }} onClick={() => jumpToEvent(event)} title={event.name + ' — ' + shortAge(event.ma)} aria-label={'Jump to ' + event.name} />
+              <button key={event.id} className="timeline-event" style={{ left: ((1 - event.ma / MAX_AGE) * 100) + '%' }} onClick={() => jumpToEvent(event)} title={event.name + ' — ' + shortAge(event.ma)} aria-label={'Jump to ' + event.name} />
             ))}
           </div>
           <div className="timeline-labels" aria-hidden="true"><span>1.8 Ga</span><span>1.5 Ga</span><span>1 Ga</span><span>500 Ma</span><span>250 Ma</span><span>NOW</span></div>
