@@ -11,16 +11,21 @@ const DAY_TEXTURE = 'https://unpkg.com/three-globe/example/img/earth-blue-marble
 const BUMP_TEXTURE = 'https://unpkg.com/three-globe/example/img/earth-topology.png';
 const STAR_TEXTURE = 'https://unpkg.com/three-globe/example/img/night-sky.png';
 
-const CACHE_DB_NAME = 'intheglobe-frame-cache-v2';
-const CACHE_STORE_NAME = 'frames';
-const CACHE_MANIFEST_KEY = 'intheglobe-frame-manifest-v2';
+const CACHE_DB_NAME = 'intheglobe-keyframe-cache-v3';
+const CACHE_STORE_NAME = 'keyframes';
+const CACHE_MANIFEST_KEY = 'intheglobe-keyframe-manifest-v3';
 const MAX_AGE = 1800;
-const FRAME_STEP = 5;
-const FRAME_AGES = Array.from({ length: Math.floor(MAX_AGE / FRAME_STEP) + 1 }, (_, index) => index * FRAME_STEP);
+const PLAYBACK_STEP = 5;
+const KEYFRAME_STEP = 25;
+const KEYFRAME_AGES = Array.from({ length: Math.floor(MAX_AGE / KEYFRAME_STEP) + 1 }, (_, index) => Math.min(index * KEYFRAME_STEP, MAX_AGE));
 const PRELOAD_WORKERS = 6;
 const FRAME_REQUEST_TIMEOUT_MS = 30000;
 const FRAME_REQUEST_RETRIES = 3;
-const PRIORITY_PRELOAD_COUNT = 36;
+const PRIORITY_KEYFRAMES = 8;
+
+function keyframeAgeFor(age) {
+  return Math.min(MAX_AGE, Math.round(Number(age) / KEYFRAME_STEP) * KEYFRAME_STEP);
+}
 
 function frameKey(age) {
   return modelForAge(age) + ':' + String(Math.round(age));
@@ -282,7 +287,7 @@ function App() {
   const [eventMode, setEventMode] = useState(true);
   const [autoRotate, setAutoRotate] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [cacheProgress, setCacheProgress] = useState({ cached: 0, total: FRAME_AGES.length });
+  const [cacheProgress, setCacheProgress] = useState({ cached: 0, total: KEYFRAME_AGES.length });
   const frameCacheRef = useRef(new Map());
   const preloadControllersRef = useRef(new Set());
   const foregroundRequestRef = useRef(0);
@@ -295,6 +300,7 @@ function App() {
   );
 
   const period = useMemo(() => nearestPeriod(age), [age]);
+  const keyframeAge = useMemo(() => keyframeAgeFor(age), [age]);
   const visibleEvents = useMemo(() => EVENTS.filter((event) => Math.abs(event.ma - age) < 95), [age]);
 
   const results = useMemo(() => {
@@ -344,21 +350,16 @@ function App() {
     const generation = cacheGenerationRef.current;
 
     const warm = async () => {
-      const manifest = readFrameManifest();
       const storedKeys = await getStoredFrameKeys();
-      let cached = FRAME_AGES.filter((frameAge) => frameAge === 0 || storedKeys.has(frameKey(frameAge))).length;
-      setCacheProgress({ cached, total: FRAME_AGES.length });
+      let cached = KEYFRAME_AGES.filter((frameAge) => storedKeys.has(frameKey(frameAge))).length;
+      setCacheProgress({ cached, total: KEYFRAME_AGES.length });
 
-      const missing = FRAME_AGES.filter((frameAge) => frameAge > 0 && !storedKeys.has(frameKey(frameAge)));
-      // Prioritise the near-present sequence so playback becomes useful quickly,
-      // then continue through the rest of deep time.
-      missing.sort((a, b) => a - b);
-      let cursor = 0;
+      const missing = KEYFRAME_AGES.filter((frameAge) => !storedKeys.has(frameKey(frameAge)));
       const retryQueue = [];
       const retryCounts = new Map();
       const ordered = [...missing].sort((a, b) => {
-        const aPriority = a <= PRIORITY_PRELOAD_COUNT * FRAME_STEP ? 0 : 1;
-        const bPriority = b <= PRIORITY_PRELOAD_COUNT * FRAME_STEP ? 0 : 1;
+        const aPriority = a <= PRIORITY_KEYFRAMES * KEYFRAME_STEP ? 0 : 1;
+        const bPriority = b <= PRIORITY_KEYFRAMES * KEYFRAME_STEP ? 0 : 1;
         return aPriority - bPriority || a - b;
       });
 
@@ -392,7 +393,7 @@ function App() {
             if (cancelled || generation !== cacheGenerationRef.current) return;
             frameCacheRef.current.set(key, features);
             cached += 1;
-            setCacheProgress({ cached: Math.min(cached, FRAME_AGES.length), total: FRAME_AGES.length });
+            setCacheProgress({ cached: Math.min(cached, KEYFRAME_AGES.length), total: KEYFRAME_AGES.length });
           } catch (error) {
             if (!cancelled && generation === cacheGenerationRef.current) {
               const attempts = (retryCounts.get(frameAge) || 0) + 1;
@@ -425,7 +426,7 @@ function App() {
     if (!baseLand || status === 'error') return;
     const currentRequest = ++requestRef.current;
     const controller = new AbortController();
-    const targetAge = Math.round(age);
+    const targetAge = keyframeAge; 
     const delay = isPlaying ? 0 : reducedMotion ? 20 : 0;
 
     const timer = window.setTimeout(async () => {
@@ -446,7 +447,7 @@ function App() {
       const key = frameKey(targetAge);
       try {
         setStatus('loading');
-        setStatusText('Loading ' + shortAge(targetAge) + ' from the local frame cache…');
+        setStatusText('Loading ' + shortAge(targetAge) + ' keyframe…');
 
         let features = frameCacheRef.current.get(key);
         if (!features) {
@@ -465,12 +466,12 @@ function App() {
         if (currentRequest !== requestRef.current) return;
         setLand(features);
         setStatus('ready');
-        setStatusText(shortAge(targetAge) + ' reconstruction · cache resumed');
+        setStatusText(shortAge(targetAge) + ' keyframe · cache resumed');
       } catch (error) {
         if (currentRequest !== requestRef.current || error?.name === 'AbortError') return;
         console.warn('Reconstruction unavailable after retries; keeping last valid geometry.', error);
         setStatus('warning');
-        setStatusText(shortAge(targetAge) + ' could not be loaded — retry by scrubbing again');
+        setStatusText(shortAge(targetAge) + ' keyframe could not be loaded — retry by scrubbing again');
       } finally {
         if (foregroundRequestRef.current === foregroundRequestId) {
           foregroundLoadingRef.current = false;
@@ -482,7 +483,7 @@ function App() {
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [age, baseLand, isPlaying, reducedMotion]);
+  }, [keyframeAge, baseLand, isPlaying, reducedMotion]);
 
   useEffect(() => {
     if (!globeRef.current) return;
@@ -500,7 +501,7 @@ function App() {
     if (!isPlaying) return;
     const interval = window.setInterval(() => {
       setAge((previous) => {
-        const next = Math.min(MAX_AGE, previous + FRAME_STEP);
+        const next = Math.min(MAX_AGE, previous + PLAYBACK_STEP);
         setDirection(next > previous ? 'Into the past' : 'At the deep-time boundary');
         if (next >= MAX_AGE) setIsPlaying(false);
         return next;
@@ -518,7 +519,7 @@ function App() {
     setIsResettingCache(true);
     setIsPlaying(false);
     cacheGenerationRef.current += 1;
-    setCacheProgress({ cached: 1, total: FRAME_AGES.length });
+    setCacheProgress({ cached: 1, total: KEYFRAME_AGES.length });
     frameCacheRef.current.clear();
     for (const controller of preloadControllersRef.current) controller.abort();
     preloadControllersRef.current.clear();
@@ -526,7 +527,7 @@ function App() {
     try {
       await clearStoredFrames();
       setStatus('loading');
-      setStatusText('Frame cache reset · rebuilding in the background…');
+      setStatusText('Keyframe cache reset · rebuilding in the background…');
     } finally {
       setIsResettingCache(false);
       setCacheGeneration((value) => value + 1);
@@ -581,7 +582,7 @@ function App() {
           <div><div className="brand-name">intheglobe</div><div className="brand-sub">where was the Earth?</div></div>
         </div>
         <div className="header-status">
-          <div className="status-dot" data-status={status} /><span>{statusText}</span><span className="status-divider">·</span><span>model {modelForAge(age)}</span><span className="status-divider">·</span><span>frames {cacheProgress.cached}/{cacheProgress.total}</span>
+          <div className="status-dot" data-status={status} /><span>{statusText}</span><span className="status-divider">·</span><span>model {modelForAge(age)}</span><span className="status-divider">·</span><span>keyframes {cacheProgress.cached}/{cacheProgress.total}</span>
         </div>
         <button className="present-button" onClick={() => handleAge(0)}><span aria-hidden="true">↻</span> Present day</button>
       </header>
@@ -607,7 +608,7 @@ function App() {
             polygonSideColor={() => period.ma === 0 ? 'rgba(88, 152, 107, 0.14)' : 'rgba(145, 104, 61, 0.16)'}
             polygonStrokeColor={() => 'rgba(244, 246, 232, 0.22)'}
             polygonLabel={() => '<div class="globe-tooltip"><strong>Reconstructed land</strong><br/><span>' + ageLabel(age) + '</span></div>'}
-            polygonTransitionDuration={reducedMotion ? 0 : isPlaying ? 160 : 700}
+            polygonTransitionDuration={reducedMotion ? 0 : isPlaying ? 1000 : 700}
             pathsData={plateMode ? PLATE_BOUNDARIES : []}
             pathPoints={(path) => path.points}
             pathPointLat={(point) => point[1]}
@@ -723,7 +724,7 @@ function App() {
         </div>
 
         <div className="timeline-actions">
-          <button className="play-button" onClick={() => setIsPlaying((value) => !value)} aria-label={isPlaying ? 'Pause geological time playback' : 'Play the locally cached geological time sequence'}><span aria-hidden="true">{isPlaying ? 'Ⅱ' : '▶'}</span>{isPlaying ? 'Pause journey' : 'Animate journey'}</button>
+          <button className="play-button" onClick={() => setIsPlaying((value) => !value)} aria-label={isPlaying ? 'Pause geological time playback' : 'Play the locally cached geological keyframe sequence'}><span aria-hidden="true">{isPlaying ? 'Ⅱ' : '▶'}</span>{isPlaying ? 'Pause journey' : 'Animate journey'}</button>
           <button className="reset-button" onClick={resetFrames} disabled={isResettingCache} aria-label="Reset all locally cached geological frames"><span aria-hidden="true">↺</span>{isResettingCache ? 'Resetting…' : 'Reset frames'}</button>
           <label className="toggle">
             <input type="checkbox" checked={reducedMotion} onChange={(event) => setReducedMotion(event.target.checked)} />
