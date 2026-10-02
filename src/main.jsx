@@ -255,8 +255,8 @@ function App() {
 
     const warm = async () => {
       const manifest = readFrameManifest();
-      let cached = manifest.size;
-      setCacheProgress({ cached: Math.min(cached + (manifest.has(frameKey(0)) ? 0 : 1), FRAME_AGES.length), total: FRAME_AGES.length });
+      let cached = FRAME_AGES.filter((frameAge) => frameAge === 0 || manifest.has(frameKey(frameAge))).length;
+      setCacheProgress({ cached, total: FRAME_AGES.length });
 
       const queue = FRAME_AGES.filter((frameAge) => frameAge > 0 && !manifest.has(frameKey(frameAge)));
       let cursor = 0;
@@ -354,7 +354,7 @@ function App() {
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [age, baseLand, isPlaying, reducedMotion, status]);
+  }, [age, baseLand, isPlaying, reducedMotion]);
 
   useEffect(() => {
     if (!globeRef.current) return;
