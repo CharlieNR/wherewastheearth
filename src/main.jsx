@@ -434,6 +434,18 @@ function flattenFeatures(collection) {
   return [];
 }
 
+function geometryToPaths(geometry) {
+  if (!geometry) return [];
+  if (geometry.type === 'LineString' || geometry.type === 'MultiLineString') return geometry.type === 'LineString' ? [geometry.coordinates || []] : geometry.coordinates || [];
+  return [];
+}
+
+function meshToPaths(mesh) {
+  return geometryToPaths(mesh)
+    .filter((points) => points.length > 1)
+    .map((points) => ({ kind: 'country', points }));
+}
+
 function App() {
   const globeRef = useRef(null);
   const stageRef = useRef(null);
@@ -442,6 +454,7 @@ function App() {
   const [direction, setDirection] = useState('Start exploring');
   const [land, setLand] = useState([]);
   const [baseLand, setBaseLand] = useState(null);
+  const [countryBoundaries, setCountryBoundaries] = useState([]);
   const [status, setStatus] = useState('loading');
   const [statusText, setStatusText] = useState('Preparing Earth…');
   const [selected, setSelected] = useState({
@@ -458,6 +471,7 @@ function App() {
   const [cacheProgress, setCacheProgress] = useState({ cached: 0, total: KEYFRAME_AGES.length });
   const frameCacheRef = useRef(new Map());
   const preloadControllersRef = useRef(new Set());
+  const playbackPreloadControllerRef = useRef(null);
   const foregroundRequestRef = useRef(0);
   const foregroundLoadingRef = useRef(false);
   const cacheGenerationRef = useRef(0);
@@ -502,6 +516,10 @@ function App() {
   const period = useMemo(() => nearestPeriod(age), [age]);
   const keyframeAge = useMemo(() => keyframeAgeFor(age), [age]);
   const visibleEvents = useMemo(() => EVENTS.filter((event) => Math.abs(event.ma - age) < 95), [age]);
+  const globePaths = useMemo(() => [
+    ...(age < 0.1 ? countryBoundaries : []),
+    ...(plateMode ? PLATE_BOUNDARIES.map((path) => ({ kind: 'plate', ...path })) : []),
+  ], [age, countryBoundaries, plateMode]);
 
   const results = useMemo(() => {
     const query = search.trim().toLowerCase();
@@ -530,10 +548,19 @@ function App() {
         if (!response.ok) throw new Error('World data unavailable');
         const topology = await response.json();
         const feature = topojson.feature(topology, topology.objects.land);
+        const countryMesh = topology.objects.countries
+          ? topojson.mesh(topology, topology.objects.countries, (a, b) => a !== b)
+          : null;
         if (cancelled) return;
         setBaseLand(feature);
         setLand(flattenFeatures(feature));
-        diagnostic('info', 'WORLD', 'World atlas loaded', { geometryType: flattenFeatures(feature)[0]?.geometry?.type, featureCount: flattenFeatures(feature).length });
+        const boundaries = meshToPaths(countryMesh);
+        setCountryBoundaries(boundaries);
+        diagnostic('info', 'WORLD', 'World atlas loaded', {
+          geometryType: flattenFeatures(feature)[0]?.geometry?.type,
+          featureCount: flattenFeatures(feature).length,
+          countryBoundaryPathCount: boundaries.length,
+        });
         setStatus('ready');
         setStatusText('Ready to explore');
       } catch (error) {
@@ -696,6 +723,16 @@ function App() {
         }
 
         if (!features) {
+          const cachedEntries = Array.from(frameCacheRef.current.entries())
+            .map(([cacheKey, cachedFeatures]) => ({ age: Number(String(cacheKey).split(':').at(-1)), features: cachedFeatures }))
+            .filter((entry) => Number.isFinite(entry.age) && entry.features?.length);
+          const nearestCached = cachedEntries.length
+            ? cachedEntries.reduce((nearest, entry) => Math.abs(entry.age - targetAge) < Math.abs(nearest.age - targetAge) ? entry : nearest, cachedEntries[0])
+            : null;
+          if (nearestCached) {
+            setLand(nearestCached.features);
+            diagnostic('info', 'FRAME', 'Nearest cached geometry shown while target loads', { targetAge, fallbackAge: nearestCached.age });
+          }
           setStatusText('Loading ' + shortAge(targetAge) + ' reconstruction…');
           features = await fetchReconstructionWithRetry(targetAge, controller.signal);
           if (currentRequest !== requestRef.current) return;
@@ -739,15 +776,67 @@ function App() {
 
   useEffect(() => {
     if (!isPlaying) return;
+
+    const startAge = age;
+    if (startAge <= 0) {
+      setIsPlaying(false);
+      setDirection('Present day');
+      return;
+    }
+
+    playbackPreloadControllerRef.current?.abort();
+    const controller = new AbortController();
+    playbackPreloadControllerRef.current = controller;
+
+    const upcoming = KEYFRAME_AGES
+      .filter((frameAge) => frameAge < keyframeAge && frameAge >= 0)
+      .sort((a, b) => b - a)
+      .slice(0, 10);
+
+    (async () => {
+      diagnostic('info', 'PLAY', 'Forward playback preload started', {
+        fromAge: startAge,
+        direction: 'toward present',
+        keyframes: upcoming,
+      });
+
+      for (const frameAge of upcoming) {
+        if (controller.signal.aborted) return;
+        const key = frameKey(frameAge);
+        let features = frameCacheRef.current.get(key);
+        if (!features) features = await getStoredFrame(frameAge);
+
+        if (!features) {
+          try {
+            features = await fetchReconstructionWithRetry(frameAge, controller.signal);
+            if (controller.signal.aborted) return;
+            await putStoredFrame(frameAge, features);
+          } catch (error) {
+            if (error?.name === 'AbortError') return;
+            diagnostic('warn', 'PLAY', 'Playback prefetch failed', { age: frameAge, message: error?.message });
+            continue;
+          }
+        }
+
+        frameCacheRef.current.set(key, features);
+        diagnostic('info', 'PLAY', 'Playback frame ready', { age: frameAge });
+      }
+    })();
+
     const interval = window.setInterval(() => {
       setAge((previous) => {
-        const next = Math.min(MAX_AGE, previous + PLAYBACK_STEP);
-        setDirection(next > previous ? 'Into the past' : 'At the deep-time boundary');
-        if (next >= MAX_AGE) setIsPlaying(false);
+        const next = Math.max(0, previous - PLAYBACK_STEP);
+        setDirection(next < previous ? 'Toward the present' : 'Present day');
+        if (next <= 0) setIsPlaying(false);
         return next;
       });
     }, reducedMotion ? 320 : 180);
-    return () => window.clearInterval(interval);
+
+    return () => {
+      window.clearInterval(interval);
+      controller.abort();
+      if (playbackPreloadControllerRef.current === controller) playbackPreloadControllerRef.current = null;
+    };
   }, [isPlaying, reducedMotion]);
 
   useEffect(() => {
@@ -946,21 +1035,22 @@ function App() {
             atmosphereAltitude={0.17}
             polygonsData={land}
             polygonGeoJsonGeometry={(feature) => feature.geometry}
-            polygonAltitude={0.004}
-            polygonCapColor={() => period.ma === 0 ? 'rgba(229, 240, 215, 0.02)' : 'rgba(214, 188, 121, 0.36)'}
-            polygonSideColor={() => period.ma === 0 ? 'rgba(88, 152, 107, 0.14)' : 'rgba(145, 104, 61, 0.16)'}
-            polygonStrokeColor={() => 'rgba(244, 246, 232, 0.22)'}
-            polygonLabel={() => '<div class="globe-tooltip"><strong>Reconstructed land</strong><br/><span>' + ageLabel(age) + '</span></div>'}
-            polygonTransitionDuration={reducedMotion ? 0 : isPlaying ? 1000 : 700}
-            pathsData={plateMode ? PLATE_BOUNDARIES : []}
+            polygonAltitude={0.01}
+            polygonCapColor={() => period.ma === 0 ? '#d8e8b8' : '#c5d6a0'}
+            polygonSideColor={() => period.ma === 0 ? '#7e9b70' : '#718663'}
+            polygonStrokeColor={() => 'rgba(247, 255, 232, 0.72)'}
+            polygonLabel={() => '<div class="globe-tooltip"><strong>Reconstructed landmass</strong><br/><span>' + ageLabel(age) + '</span></div>'}
+            polygonTransitionDuration={reducedMotion ? 0 : isPlaying ? 850 : 500}
+            pathsData={globePaths}
             pathPoints={(path) => path.points}
             pathPointLat={(point) => point[1]}
             pathPointLng={(point) => point[0]}
-            pathColor={(path) => path.type === 'Divergent' ? '#78ddb5' : path.type === 'Convergent' ? '#f0ad75' : '#9ac8ff'}
-            pathStroke={2.1}
+            pathColor={(path) => path.kind === 'country' ? '#ffffff' : path.type === 'Divergent' ? '#78ddb5' : path.type === 'Convergent' ? '#f0ad75' : '#9ac8ff'}
+            pathStroke={(path) => path.kind === 'country' ? 1.0 : 2.1}
+            pathAltitude={(path) => path.kind === 'country' ? 0.022 : 0.03}
             pathResolution={3}
-            pathDashLength={plateMode ? 0.62 : 0}
-            pathDashGap={plateMode ? 0.28 : 0}
+            pathDashLength={(path) => path.kind === 'country' ? 1 : (plateMode ? 0.62 : 0)}
+            pathDashGap={(path) => path.kind === 'country' ? 0 : (plateMode ? 0.28 : 0)}
             pathDashAnimateTime={2600}
             pointsData={eventMode ? visibleEvents : []}
             pointLat={(point) => point.lat}
@@ -1067,7 +1157,7 @@ function App() {
         </div>
 
         <div className="timeline-actions">
-          <button className="play-button" onClick={() => setIsPlaying((value) => !value)} aria-label={isPlaying ? 'Pause geological time playback' : 'Play the locally cached geological keyframe sequence'}><span aria-hidden="true">{isPlaying ? 'Ⅱ' : '▶'}</span>{isPlaying ? 'Pause journey' : 'Animate journey'}</button>
+          <button className="play-button" onClick={() => age > 0 && setIsPlaying((value) => !value)} disabled={age <= 0} aria-label={isPlaying ? 'Pause geological time playback' : age > 0 ? 'Play geological time forward toward the present' : 'At present day'}><span aria-hidden="true">{isPlaying ? 'Ⅱ' : '▶'}</span>{isPlaying ? 'Pause journey' : age > 0 ? 'Play forward' : 'At present'}</button>
           <button className="reset-button" onClick={resetFrames} disabled={isResettingCache} aria-label="Reset all locally cached geological frames"><span aria-hidden="true">↺</span>{isResettingCache ? 'Resetting…' : 'Reset frames'}</button>
           <label className="toggle">
             <input type="checkbox" checked={reducedMotion} onChange={(event) => setReducedMotion(event.target.checked)} />
