@@ -120,7 +120,7 @@ button { color: inherit; }
 .timeline-readout { display: grid; gap: 2px; text-align: right; }
 .timeline-readout span { font-family: 'Manrope', sans-serif; font-size: 13px; }
 .timeline-readout small { color: var(--soft); font-size: 9px; }
-.slider-wrap { position: relative; margin: 12px 4px 0; }
+.slider-wrap { position: relative; margin: 12px 4px 0; direction: ltr; }
 .slider-wrap input[type='range'] { position: relative; z-index: 3; width: 100%; appearance: none; background: transparent; }
 .slider-wrap input[type='range']::-webkit-slider-runnable-track { height: 4px; background: rgba(230,245,234,.12); border-radius: 999px; }
 .slider-wrap input[type='range']::-webkit-slider-thumb { appearance: none; width: 16px; height: 16px; margin-top: -6px; border-radius: 50%; border: 3px solid #0b3328; background: var(--lime); box-shadow: 0 0 0 4px rgba(217,245,200,.08), 0 0 18px rgba(217,245,200,.28); cursor: pointer; }
