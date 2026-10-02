@@ -385,6 +385,7 @@ function App() {
   const [cacheGeneration, setCacheGeneration] = useState(0);
   const [isResettingCache, setIsResettingCache] = useState(false);
   const [terminalOpen, setTerminalOpen] = useState(false);
+  const terminalBodyRef = useRef(null);
   const [diagnosticLines, setDiagnosticLines] = useState([
     '--- intheglobe diagnostics boot ---',
     'INFO  [SYSTEM] Terminal ready. Detailed runtime logging is enabled.',
@@ -400,6 +401,12 @@ function App() {
     diagnostic('info', 'SYSTEM', 'Diagnostic terminal connected');
     return () => setDiagnosticSink(null);
   }, []);
+
+  useEffect(() => {
+    if (!terminalOpen) return;
+    const element = terminalBodyRef.current;
+    if (element) element.scrollTop = element.scrollHeight;
+  }, [diagnosticLines, terminalOpen]);
 
   useEffect(() => {
     const onError = (event) => diagnostic('error', 'WINDOW', 'Unhandled browser error', { message: event.error?.message || event.message, source: event.filename, line: event.lineno, column: event.colno });
@@ -728,13 +735,21 @@ function App() {
               <span>live runtime log · {diagnosticLines.length} lines · current {shortAge(age)} · keyframe {shortAge(keyframeAge)}</span>
             </div>
             <div className="terminal-tools">
-              <button onClick={() => navigator.clipboard?.writeText(diagnosticLines.join('\\n')).then(() => diagnostic('info','UI','Diagnostic log copied'))}>Copy</button>
+              <button onClick={async () => {
+                try {
+                  if (!navigator.clipboard) throw new Error('Clipboard API unavailable');
+                  await navigator.clipboard.writeText(diagnosticLines.join('\\n'));
+                  diagnostic('info', 'UI', 'Diagnostic log copied');
+                } catch (error) {
+                  diagnostic('warn', 'UI', 'Could not copy diagnostic log', { message: error?.message });
+                }
+              }}>Copy</button>
               <button onClick={() => setDiagnosticLines(['--- log cleared ---', new Date().toISOString().slice(11, 23) + ' INFO  [SYSTEM] Log cleared by user.'])}>Clear</button>
               <button onClick={() => diagnostic('info','SYSTEM','Runtime snapshot', { age, keyframeAge, model: modelForAge(keyframeAge), cache: cacheProgress.cached + '/' + cacheProgress.total, online: navigator.onLine, indexedDB: 'indexedDB' in window, viewport: window.innerWidth + 'x' + window.innerHeight })}>Snapshot</button>
               <button onClick={() => setTerminalOpen(false)} aria-label="Close diagnostics terminal">×</button>
             </div>
           </div>
-          <pre className="terminal-body">{diagnosticLines.join('\\n')}</pre>
+          <pre ref={terminalBodyRef} className="terminal-body">{diagnosticLines.join('\\n')}</pre>
           <div className="terminal-input"><span>&gt;</span><span>Live diagnostics only — requests, retries, cache hits/misses, cancellations, and browser errors are logged above.</span></div>
           <div className="terminal-foot"><span>HTTP · CACHE · FRAME · WORLD · UI · WINDOW</span><span>Current model: {modelForAge(keyframeAge)} · Cache: {cacheProgress.cached}/{cacheProgress.total}</span></div>
         </div>
