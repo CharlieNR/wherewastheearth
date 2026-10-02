@@ -191,22 +191,6 @@ async function fetchReconstructionWithRetry(age, baseLand, signal) {
   throw lastError || new Error('Frame request failed');
 }
 
-
-  let lastError;
-  for (let attempt = 1; attempt <= FRAME_REQUEST_RETRIES; attempt += 1) {
-    if (signal?.aborted) throw new DOMException('Request aborted', 'AbortError');
-    try {
-      return await fetchReconstructionFrame(age, baseLand, signal);
-    } catch (error) {
-      lastError = error;
-      if (error?.name === 'AbortError') throw error;
-      console.warn('Frame ' + shortAge(age) + ' attempt ' + attempt + '/' + FRAME_REQUEST_RETRIES + ' failed.', error);
-      if (attempt < FRAME_REQUEST_RETRIES) await sleep(250 * attempt);
-    }
-  }
-  throw lastError || new Error('Frame request failed');
-}
-
 async function fetchReconstructionFrame(age, baseLand, signal) {
   const payload = new URLSearchParams();
   payload.set('feature_collection', JSON.stringify({
