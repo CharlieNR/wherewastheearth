@@ -709,49 +709,104 @@ function App() {
     <div className="app-shell">
       <header className="topbar">
         <div className="brand">
-          <div className="brand-mark" aria-hidden="true"><span /><span /><span /></div>
+          <button
+            className="brand-mark"
+            type="button"
+            onClick={() => {
+              setTerminalOpen((value) => {
+                const next = !value;
+                diagnostic('info', 'UI', next ? 'Diagnostics terminal opened from globe icon' : 'Diagnostics terminal closed from globe icon', {
+                  age,
+                  keyframe: keyframeAge,
+                  cache: cacheProgress.cached + '/' + cacheProgress.total,
+                });
+                return next;
+              });
+            }}
+            aria-expanded={terminalOpen}
+            aria-controls="diagnostics-terminal"
+            aria-label="Open diagnostics terminal"
+            title="Open diagnostics terminal"
+          >
+            <span /><span /><span />
+          </button>
           <div><div className="brand-name">intheglobe</div><div className="brand-sub">where was the Earth?</div></div>
         </div>
         <div className="header-status">
           <div className="status-dot" data-status={status} /><span>{statusText}</span><span className="status-divider">·</span><span>model {modelForAge(age)}</span><span className="status-divider">·</span><span>keyframes {cacheProgress.cached}/{cacheProgress.total}</span>
         </div>
         <div className="header-actions">
-          <button className="diagnostics-button" onClick={() => {
-            setTerminalOpen((value) => {
-              const next = !value;
-              diagnostic('info', 'UI', next ? 'Diagnostics terminal opened' : 'Diagnostics terminal closed', { age, keyframe: keyframeAge, cache: cacheProgress.cached + '/' + cacheProgress.total });
-              return next;
-            });
-          }} aria-expanded={terminalOpen} aria-label="Open diagnostics terminal" title="Open diagnostics terminal"><span className="globe-icon" aria-hidden="true">🌐</span><span>Terminal</span></button>
           <button className="present-button" onClick={() => handleAge(0)}><span aria-hidden="true">↻</span> Present day</button>
         </div>
       </header>
 
       {terminalOpen && (
-        <div className="diagnostics-terminal" role="dialog" aria-label="intheglobe diagnostics terminal">
-          <div className="terminal-head">
-            <div>
-              <strong>intheglobe / diagnostics</strong>
-              <span>live runtime log · {diagnosticLines.length} lines · current {shortAge(age)} · keyframe {shortAge(keyframeAge)}</span>
+        <div
+          className="diagnostics-overlay"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setTerminalOpen(false);
+          }}
+        >
+          <section
+            id="diagnostics-terminal"
+            className="diagnostics-terminal"
+            role="dialog"
+            aria-modal="true"
+            aria-label="intheglobe diagnostics terminal"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <div className="terminal-windowbar">
+              <div className="terminal-window-title">
+                <span className="terminal-dot terminal-dot-red" />
+                <span className="terminal-dot terminal-dot-amber" />
+                <span className="terminal-dot terminal-dot-green" />
+                <strong>intheglobe — diagnostics terminal</strong>
+              </div>
+              <div className="terminal-window-meta">{diagnosticLines.length} lines · live</div>
+              <button className="terminal-close" type="button" onClick={() => setTerminalOpen(false)} aria-label="Close terminal">×</button>
             </div>
-            <div className="terminal-tools">
-              <button onClick={async () => {
-                try {
-                  if (!navigator.clipboard) throw new Error('Clipboard API unavailable');
-                  await navigator.clipboard.writeText(diagnosticLines.join('\\n'));
-                  diagnostic('info', 'UI', 'Diagnostic log copied');
-                } catch (error) {
-                  diagnostic('warn', 'UI', 'Could not copy diagnostic log', { message: error?.message });
-                }
-              }}>Copy</button>
-              <button onClick={() => setDiagnosticLines(['--- log cleared ---', new Date().toISOString().slice(11, 23) + ' INFO  [SYSTEM] Log cleared by user.'])}>Clear</button>
-              <button onClick={() => diagnostic('info','SYSTEM','Runtime snapshot', { age, keyframeAge, model: modelForAge(keyframeAge), cache: cacheProgress.cached + '/' + cacheProgress.total, online: navigator.onLine, indexedDB: 'indexedDB' in window, viewport: window.innerWidth + 'x' + window.innerHeight })}>Snapshot</button>
-              <button onClick={() => setTerminalOpen(false)} aria-label="Close diagnostics terminal">×</button>
+
+            <div className="terminal-head">
+              <div>
+                <strong>RUNTIME DIAGNOSTICS</strong>
+                <span>Current {shortAge(age)} · keyframe {shortAge(keyframeAge)} · model {modelForAge(keyframeAge)}</span>
+              </div>
+              <div className="terminal-tools">
+                <button type="button" onClick={async () => {
+                  try {
+                    if (!navigator.clipboard) throw new Error('Clipboard API unavailable');
+                    await navigator.clipboard.writeText(diagnosticLines.join('\\n'));
+                    diagnostic('info', 'UI', 'Diagnostic log copied');
+                  } catch (error) {
+                    diagnostic('warn', 'UI', 'Could not copy diagnostic log', { message: error?.message });
+                  }
+                }}>COPY LOG</button>
+                <button type="button" onClick={() => setDiagnosticLines(['--- LOG CLEARED ---', new Date().toISOString().slice(11, 23) + ' INFO  [SYSTEM] Log cleared by user.'])}>CLEAR</button>
+                <button type="button" onClick={() => diagnostic('info','SYSTEM','Runtime snapshot', {
+                  age,
+                  keyframeAge,
+                  model: modelForAge(keyframeAge),
+                  cache: cacheProgress.cached + '/' + cacheProgress.total,
+                  online: navigator.onLine,
+                  indexedDB: 'indexedDB' in window,
+                  viewport: window.innerWidth + 'x' + window.innerHeight,
+                })}>SNAPSHOT</button>
+              </div>
             </div>
-          </div>
-          <pre ref={terminalBodyRef} className="terminal-body">{diagnosticLines.join('\\n')}</pre>
-          <div className="terminal-input"><span>&gt;</span><span>Live diagnostics only — requests, retries, cache hits/misses, cancellations, and browser errors are logged above.</span></div>
-          <div className="terminal-foot"><span>HTTP · CACHE · FRAME · WORLD · UI · WINDOW</span><span>Current model: {modelForAge(keyframeAge)} · Cache: {cacheProgress.cached}/{cacheProgress.total}</span></div>
+
+            <pre ref={terminalBodyRef} className="terminal-body">{diagnosticLines.join('\\n')}</pre>
+
+            <div className="terminal-input">
+              <span>root@intheglobe:~$</span>
+              <span>Live diagnostics enabled — network, reconstruction, cache, world data, UI, and browser errors appear here.</span>
+            </div>
+
+            <div className="terminal-foot">
+              <span>HTTP · CACHE · FRAME · WORLD · UI · WINDOW</span>
+              <span>Cache {cacheProgress.cached}/{cacheProgress.total}</span>
+            </div>
+          </section>
         </div>
       )}
 
