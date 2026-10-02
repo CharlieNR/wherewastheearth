@@ -23,6 +23,31 @@ const FRAME_REQUEST_TIMEOUT_MS = 30000;
 const FRAME_REQUEST_RETRIES = 3;
 const PRIORITY_KEYFRAMES = 8;
 
+
+const MAX_DIAGNOSTIC_LINES = 2500;
+let diagnosticSink = null;
+
+function setDiagnosticSink(sink) {
+  diagnosticSink = sink;
+}
+
+function diagnostic(level, scope, message, meta) {
+  const time = new Date().toISOString().slice(11, 23);
+  let suffix = '';
+  if (meta !== undefined) {
+    try {
+      suffix = ' ' + JSON.stringify(meta);
+    } catch {
+      suffix = ' [unserializable details]';
+    }
+  }
+  const line = time + ' ' + level.toUpperCase().padEnd(5) + ' [' + scope + '] ' + message + suffix;
+  diagnosticSink?.(line);
+  if (level === 'error') console.error('[intheglobe]', line);
+  else if (level === 'warn') console.warn('[intheglobe]', line);
+  else console.info('[intheglobe]', line);
+}
+
 function keyframeAgeFor(age) {
   return Math.min(MAX_AGE, Math.round(Number(age) / KEYFRAME_STEP) * KEYFRAME_STEP);
 }
@@ -51,7 +76,11 @@ function writeFrameManifestEntry(key) {
 }
 
 function openFrameDb() {
-  if (!('indexedDB' in window)) return Promise.resolve(null);
+  if (!('indexedDB' in window)) {
+    diagnostic('warn', 'CACHE', 'IndexedDB is unavailable; persistent frame storage disabled');
+    return Promise.resolve(null);
+  }
+  diagnostic('info', 'CACHE', 'Opening IndexedDB cache', { db: CACHE_DB_NAME, store: CACHE_STORE_NAME });
   return new Promise((resolve, reject) => {
     const request = window.indexedDB.open(CACHE_DB_NAME, 1);
     request.onupgradeneeded = () => {
@@ -59,8 +88,8 @@ function openFrameDb() {
         request.result.createObjectStore(CACHE_STORE_NAME, { keyPath: 'key' });
       }
     };
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
+    request.onsuccess = () => { diagnostic('info', 'CACHE', 'IndexedDB ready'); resolve(request.result); };
+    request.onerror = () => { diagnostic('error', 'CACHE', 'IndexedDB open failed', { message: request.error?.message || String(request.error) }); reject(request.error); };
   });
 }
 
@@ -78,7 +107,8 @@ async function getStoredFrameKeys() {
 
 async function getStoredFrame(age) {
   const key = frameKey(age);
-  const db = await openFrameDb().catch(() => null);
+  diagnostic('info', 'CACHE', 'Checking stored keyframe', { age, key });
+  const db = await openFrameDb().catch((error) => { diagnostic('error', 'CACHE', 'IndexedDB read setup failed', { key, error: error?.message || String(error) }); return null; });
   if (!db) return null;
   return new Promise((resolve) => {
     const transaction = db.transaction(CACHE_STORE_NAME, 'readonly');
@@ -86,9 +116,11 @@ async function getStoredFrame(age) {
     request.onsuccess = async () => {
       const record = request.result;
       if (!record) {
+        diagnostic('info', 'CACHE', 'Keyframe miss', { key });
         resolve(null);
         return;
       }
+      diagnostic('info', 'CACHE', 'Keyframe record found', { key, encoding: record.encoding, bytes: typeof record.data === 'string' ? record.data.length : record.data?.byteLength || 0 });
       try {
         if (record.encoding === 'gzip' && typeof DecompressionStream === 'function') {
           const stream = new Blob([record.data]).stream().pipeThrough(new DecompressionStream('gzip'));
@@ -108,6 +140,7 @@ async function getStoredFrame(age) {
 
 async function putStoredFrame(age, features) {
   const key = frameKey(age);
+  diagnostic('info', 'CACHE', 'Persisting keyframe', { age, key, features: features.length });
   const compactFeatures = features.map((feature) => ({
     type: 'Feature',
     properties: {},
@@ -137,12 +170,16 @@ async function putStoredFrame(age, features) {
       transaction.onerror = resolve;
     });
     writeFrameManifestEntry(key);
+    diagnostic('info', 'CACHE', 'Keyframe persisted', { key, compressed: encoding === 'gzip' });
+  } else {
+    diagnostic('warn', 'CACHE', 'Keyframe could not be persisted because IndexedDB is unavailable', { key });
   }
   return compactFeatures;
 }
 
 
 async function clearStoredFrames() {
+  diagnostic('warn', 'CACHE', 'Clearing all stored keyframes');
   try {
     const db = await openFrameDb().catch(() => null);
     if (db) {
@@ -165,26 +202,37 @@ function sleep(ms) {
 
 async function fetchWithTimeout(url, options = {}) {
   const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), FRAME_REQUEST_TIMEOUT_MS);
+  const started = performance.now();
+  const timeout = window.setTimeout(() => {
+    diagnostic('warn', 'NET', 'Request timeout fired', { timeoutMs: FRAME_REQUEST_TIMEOUT_MS, url });
+    controller.abort();
+  }, FRAME_REQUEST_TIMEOUT_MS);
   let abortHandler;
 
   if (options.signal) {
     if (options.signal.aborted) {
       controller.abort();
     } else {
-      abortHandler = () => controller.abort();
+      abortHandler = () => {
+        diagnostic('info', 'NET', 'Request cancelled by app priority handoff', { url });
+        controller.abort();
+      };
       options.signal.addEventListener('abort', abortHandler, { once: true });
     }
   }
 
   try {
-    return await fetch(url, { ...options, signal: controller.signal });
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    diagnostic('info', 'NET', 'HTTP response received', { status: response.status, ms: Math.round(performance.now() - started), url });
+    return response;
   } catch (error) {
     if (controller.signal.aborted && !options.signal?.aborted) {
       const timeoutError = new Error('Frame request timed out after ' + Math.round(FRAME_REQUEST_TIMEOUT_MS / 1000) + ' seconds');
       timeoutError.name = 'TimeoutError';
+      diagnostic('error', 'NET', 'Request timed out', { ms: Math.round(performance.now() - started), url });
       throw timeoutError;
     }
+    diagnostic('error', 'NET', 'Network request failed', { ms: Math.round(performance.now() - started), name: error?.name, message: error?.message, url });
     throw error;
   } finally {
     window.clearTimeout(timeout);
@@ -196,12 +244,13 @@ async function fetchReconstructionWithRetry(age, baseLand, signal) {
   let lastError;
   for (let attempt = 1; attempt <= FRAME_REQUEST_RETRIES; attempt += 1) {
     if (signal?.aborted) throw new DOMException('Request aborted', 'AbortError');
+    diagnostic('info', 'FRAME', 'Attempt ' + attempt + '/' + FRAME_REQUEST_RETRIES, { age, model: modelForAge(age) });
     try {
       return await fetchReconstructionFrame(age, baseLand, signal);
     } catch (error) {
       lastError = error;
       if (error?.name === 'AbortError' && signal?.aborted) throw error;
-      console.warn('Frame ' + shortAge(age) + ' attempt ' + attempt + '/' + FRAME_REQUEST_RETRIES + ' failed.', error);
+      diagnostic('warn', 'FRAME', 'Attempt failed', { age, attempt, name: error?.name, message: error?.message });
       if (attempt < FRAME_REQUEST_RETRIES) await sleep(250 * attempt);
     }
   }
@@ -209,14 +258,25 @@ async function fetchReconstructionWithRetry(age, baseLand, signal) {
 }
 
 async function fetchReconstructionFrame(age, baseLand, signal) {
-  const payload = new URLSearchParams();
-  payload.set('feature_collection', JSON.stringify({
+  const started = performance.now();
+  const model = modelForAge(age);
+  const featureCollection = {
     type: 'FeatureCollection',
     features: [{ type: 'Feature', properties: {}, geometry: baseLand.geometry }],
-  }));
+  };
+  const geoJson = JSON.stringify(featureCollection);
+  const payload = new URLSearchParams();
+  payload.set('feature_collection', geoJson);
   payload.set('time', String(age));
-  payload.set('model', modelForAge(age));
+  payload.set('model', model);
   payload.set('anchor_plate_id', '0');
+
+  diagnostic('info', 'FRAME', 'REQUEST start', {
+    age,
+    model,
+    payloadBytes: payload.toString().length,
+    endpoint: GPLATES_URL,
+  });
 
   const response = await fetchWithTimeout(GPLATES_URL, {
     method: 'POST',
@@ -224,13 +284,42 @@ async function fetchReconstructionFrame(age, baseLand, signal) {
     body: payload,
     signal,
   });
-  if (!response.ok) throw new Error('GPlates responded with ' + response.status);
-  const reconstructed = await response.json();
+
+  const responseText = await response.text();
+  diagnostic(response.ok ? 'info' : 'error', 'FRAME', 'Response body received', {
+    age,
+    model,
+    status: response.status,
+    bytes: responseText.length,
+    ms: Math.round(performance.now() - started),
+    preview: response.ok ? undefined : responseText.slice(0, 700),
+  });
+
+  if (!response.ok) {
+    throw new Error('GPlates HTTP ' + response.status + ': ' + responseText.slice(0, 300));
+  }
+
+  let reconstructed;
+  try {
+    reconstructed = JSON.parse(responseText);
+  } catch (error) {
+    diagnostic('error', 'FRAME', 'Response was not valid JSON', { age, model, message: error?.message });
+    throw new Error('GPlates returned invalid JSON');
+  }
+
   const features = flattenFeatures(reconstructed).filter((feature) => feature.geometry).map((feature) => ({
     type: 'Feature',
     properties: {},
     geometry: feature.geometry,
   }));
+
+  diagnostic('info', 'FRAME', 'REQUEST complete', {
+    age,
+    model,
+    features: features.length,
+    ms: Math.round(performance.now() - started),
+  });
+
   if (!features.length) throw new Error('No reconstructed geometry returned');
   return features;
 }
@@ -295,9 +384,33 @@ function App() {
   const cacheGenerationRef = useRef(0);
   const [cacheGeneration, setCacheGeneration] = useState(0);
   const [isResettingCache, setIsResettingCache] = useState(false);
+  const [terminalOpen, setTerminalOpen] = useState(false);
+  const [diagnosticLines, setDiagnosticLines] = useState([
+    '--- intheglobe diagnostics boot ---',
+    'INFO  [SYSTEM] Terminal ready. Detailed runtime logging is enabled.',
+  ]);
   const [reducedMotion, setReducedMotion] = useState(
     window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false
   );
+
+  useEffect(() => {
+    setDiagnosticSink((line) => {
+      setDiagnosticLines((previous) => [...previous, line].slice(-MAX_DIAGNOSTIC_LINES));
+    });
+    diagnostic('info', 'SYSTEM', 'Diagnostic terminal connected');
+    return () => setDiagnosticSink(null);
+  }, []);
+
+  useEffect(() => {
+    const onError = (event) => diagnostic('error', 'WINDOW', 'Unhandled browser error', { message: event.error?.message || event.message, source: event.filename, line: event.lineno, column: event.colno });
+    const onRejection = (event) => diagnostic('error', 'WINDOW', 'Unhandled promise rejection', { reason: event.reason?.message || String(event.reason) });
+    window.addEventListener('error', onError);
+    window.addEventListener('unhandledrejection', onRejection);
+    return () => {
+      window.removeEventListener('error', onError);
+      window.removeEventListener('unhandledrejection', onRejection);
+    };
+  }, []);
 
   const period = useMemo(() => nearestPeriod(age), [age]);
   const keyframeAge = useMemo(() => keyframeAgeFor(age), [age]);
@@ -324,6 +437,7 @@ function App() {
     const load = async () => {
       try {
         setStatus('loading');
+        diagnostic('info', 'WORLD', 'Loading world atlas', { url: WORLD_URL });
         setStatusText('Loading the land surface…');
         const response = await fetch(WORLD_URL);
         if (!response.ok) throw new Error('World data unavailable');
@@ -332,10 +446,11 @@ function App() {
         if (cancelled) return;
         setBaseLand(feature);
         setLand(flattenFeatures(feature));
+        diagnostic('info', 'WORLD', 'World atlas loaded', { geometryType: feature.geometry?.type, featureCount: flattenFeatures(feature).length });
         setStatus('ready');
         setStatusText('Ready to explore');
       } catch (error) {
-        console.error(error);
+        diagnostic('error', 'WORLD', 'World atlas load failed', { name: error?.name, message: error?.message });
         setStatus('error');
         setStatusText('Earth data could not be loaded');
       }
@@ -350,9 +465,11 @@ function App() {
     const generation = cacheGenerationRef.current;
 
     const warm = async () => {
+      diagnostic('info', 'CACHE', 'Background keyframe preload started', { total: KEYFRAME_AGES.length, workers: PRELOAD_WORKERS });
       const storedKeys = await getStoredFrameKeys();
       let cached = KEYFRAME_AGES.filter((frameAge) => storedKeys.has(frameKey(frameAge))).length;
       setCacheProgress({ cached, total: KEYFRAME_AGES.length });
+      diagnostic('info', 'CACHE', 'Cache inventory checked', { cached, total: KEYFRAME_AGES.length, missing: KEYFRAME_AGES.length - cached });
 
       const missing = KEYFRAME_AGES.filter((frameAge) => !storedKeys.has(frameKey(frameAge)));
       const retryQueue = [];
@@ -393,6 +510,7 @@ function App() {
             if (cancelled || generation !== cacheGenerationRef.current) return;
             frameCacheRef.current.set(key, features);
             cached += 1;
+            diagnostic('info', 'CACHE', 'Background keyframe ready', { age: frameAge, progress: cached + '/' + KEYFRAME_AGES.length });
             setCacheProgress({ cached: Math.min(cached, KEYFRAME_AGES.length), total: KEYFRAME_AGES.length });
           } catch (error) {
             if (!cancelled && generation === cacheGenerationRef.current) {
@@ -401,7 +519,7 @@ function App() {
               if (attempts <= FRAME_REQUEST_RETRIES) {
                 retryQueue.push(frameAge);
               } else {
-                console.warn('Skipping ' + shortAge(frameAge) + ' after ' + attempts + ' failed preload attempts.', error);
+                diagnostic('error', 'CACHE', 'Skipping keyframe after retries', { age: frameAge, attempts, message: error?.message });
               }
             }
           } finally {
@@ -430,6 +548,7 @@ function App() {
     const delay = isPlaying ? 0 : reducedMotion ? 20 : 0;
 
     const timer = window.setTimeout(async () => {
+      diagnostic('info', 'UI', 'Foreground keyframe requested', { age, keyframeAge: targetAge, playing: isPlaying });
       foregroundLoadingRef.current = true;
       const foregroundRequestId = ++foregroundRequestRef.current;
       for (const controller of preloadControllersRef.current) controller.abort();
@@ -452,7 +571,10 @@ function App() {
         let features = frameCacheRef.current.get(key);
         if (!features) {
           features = await getStoredFrame(targetAge);
-          if (features) frameCacheRef.current.set(key, features);
+          if (features) {
+            frameCacheRef.current.set(key, features);
+            diagnostic('info', 'CACHE', 'Foreground keyframe cache hit', { age: targetAge });
+          }
         }
 
         if (!features) {
@@ -584,8 +706,26 @@ function App() {
         <div className="header-status">
           <div className="status-dot" data-status={status} /><span>{statusText}</span><span className="status-divider">·</span><span>model {modelForAge(age)}</span><span className="status-divider">·</span><span>keyframes {cacheProgress.cached}/{cacheProgress.total}</span>
         </div>
-        <button className="present-button" onClick={() => handleAge(0)}><span aria-hidden="true">↻</span> Present day</button>
+        <div className="header-actions">
+          <button className="diagnostics-button" onClick={() => setTerminalOpen((value) => !value)} aria-expanded={terminalOpen} aria-label="Open diagnostics terminal" title="Open diagnostics terminal">🌐<span>Terminal</span></button>
+          <button className="present-button" onClick={() => handleAge(0)}><span aria-hidden="true">↻</span> Present day</button>
+        </div>
       </header>
+
+      {terminalOpen && (
+        <div className="diagnostics-terminal" role="dialog" aria-label="intheglobe diagnostics terminal">
+          <div className="terminal-head">
+            <div><strong>intheglobe / diagnostics</strong><span>live runtime log · {diagnosticLines.length} lines</span></div>
+            <div className="terminal-tools">
+              <button onClick={() => navigator.clipboard?.writeText(diagnosticLines.join('\\n'))}>Copy</button>
+              <button onClick={() => setDiagnosticLines(['--- log cleared ---'])}>Clear</button>
+              <button onClick={() => setTerminalOpen(false)} aria-label="Close diagnostics terminal">×</button>
+            </div>
+          </div>
+          <pre className="terminal-body">{diagnosticLines.join('\\n')}</pre>
+          <div className="terminal-foot"><span>HTTP · CACHE · FRAME · WORLD · UI · WINDOW</span><span>Press Terminal again to close</span></div>
+        </div>
+      )}
 
       <main className="experience">
         <section className="globe-stage" ref={stageRef} aria-label="Interactive Earth">
