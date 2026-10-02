@@ -17,6 +17,7 @@ const CACHE_MANIFEST_KEY = 'intheglobe-frame-manifest-v2';
 const MAX_AGE = 1800;
 const FRAME_STEP = 5;
 const FRAME_AGES = Array.from({ length: Math.floor(MAX_AGE / FRAME_STEP) + 1 }, (_, index) => index * FRAME_STEP);
+const PRELOAD_WORKERS = 6;
 
 function frameKey(age) {
   return modelForAge(age) + ':' + String(Math.round(age));
@@ -120,6 +121,23 @@ async function putStoredFrame(age, features) {
   return compactFeatures;
 }
 
+
+async function clearStoredFrames() {
+  try {
+    const db = await openFrameDb().catch(() => null);
+    if (db) {
+      await new Promise((resolve) => {
+        const transaction = db.transaction(CACHE_STORE_NAME, 'readwrite');
+        transaction.objectStore(CACHE_STORE_NAME).clear();
+        transaction.oncomplete = resolve;
+        transaction.onerror = resolve;
+      });
+    }
+  } finally {
+    try { window.localStorage.removeItem(CACHE_MANIFEST_KEY); } catch {}
+  }
+}
+
 async function fetchReconstructionFrame(age, baseLand, signal) {
   const payload = new URLSearchParams();
   payload.set('feature_collection', JSON.stringify({
@@ -201,6 +219,9 @@ function App() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [cacheProgress, setCacheProgress] = useState({ cached: 0, total: FRAME_AGES.length });
   const frameCacheRef = useRef(new Map());
+  const cacheGenerationRef = useRef(0);
+  const [cacheGeneration, setCacheGeneration] = useState(0);
+  const [isResettingCache, setIsResettingCache] = useState(false);
   const [reducedMotion, setReducedMotion] = useState(
     window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false
   );
@@ -252,20 +273,25 @@ function App() {
   useEffect(() => {
     if (!baseLand) return;
     let cancelled = false;
+    const generation = cacheGenerationRef.current;
 
     const warm = async () => {
       const manifest = readFrameManifest();
       let cached = FRAME_AGES.filter((frameAge) => frameAge === 0 || manifest.has(frameKey(frameAge))).length;
       setCacheProgress({ cached, total: FRAME_AGES.length });
 
-      const queue = FRAME_AGES.filter((frameAge) => frameAge > 0 && !manifest.has(frameKey(frameAge)));
+      const missing = FRAME_AGES.filter((frameAge) => frameAge > 0 && !manifest.has(frameKey(frameAge)));
+      // Prioritise the near-present sequence so playback becomes useful quickly,
+      // then continue through the rest of deep time.
+      missing.sort((a, b) => Math.abs(a - age) - Math.abs(b - age));
       let cursor = 0;
 
       const worker = async () => {
-        while (!cancelled) {
+        while (!cancelled && generation === cacheGenerationRef.current) {
           const index = cursor++;
-          if (index >= queue.length) return;
-          const frameAge = queue[index];
+          if (index >= missing.length) return;
+
+          const frameAge = missing[index];
           const key = frameKey(frameAge);
 
           try {
@@ -274,34 +300,31 @@ function App() {
 
             if (!features) {
               features = await fetchReconstructionFrame(frameAge, baseLand);
-              if (cancelled) return;
+              if (cancelled || generation !== cacheGenerationRef.current) return;
               await putStoredFrame(frameAge, features);
             }
 
+            if (cancelled || generation !== cacheGenerationRef.current) return;
             frameCacheRef.current.set(key, features);
             cached += 1;
             setCacheProgress({ cached: Math.min(cached, FRAME_AGES.length), total: FRAME_AGES.length });
           } catch (error) {
             console.warn('Background frame preload failed for ' + shortAge(frameAge), error);
           }
-
-          await new Promise((resolve) => window.setTimeout(resolve, 35));
         }
       };
 
-      await Promise.all([worker(), worker()]);
+      await Promise.all(Array.from({ length: PRELOAD_WORKERS }, () => worker()));
     };
 
-    const idle = window.requestIdleCallback
-      ? window.requestIdleCallback(() => warm(), { timeout: 1200 })
-      : window.setTimeout(warm, 700);
+    // Start immediately; the app no longer waits for an idle callback.
+    const start = window.setTimeout(() => warm(), 80);
 
     return () => {
       cancelled = true;
-      if (window.cancelIdleCallback && typeof idle === 'number') window.cancelIdleCallback(idle);
-      else window.clearTimeout(idle);
+      window.clearTimeout(start);
     };
-  }, [baseLand]);
+  }, [baseLand, cacheGeneration, age]);
 
   useEffect(() => {
     if (!baseLand || status === 'error') return;
@@ -384,6 +407,26 @@ function App() {
   useEffect(() => {
     document.documentElement.dataset.reducedMotion = reducedMotion ? 'true' : 'false';
   }, [reducedMotion]);
+
+  const resetFrames = async () => {
+    if (isResettingCache) return;
+    setIsResettingCache(true);
+    setIsPlaying(false);
+    cacheGenerationRef.current += 1;
+    setCacheProgress({ cached: 1, total: FRAME_AGES.length });
+    frameCacheRef.current.clear();
+
+    try {
+      await clearStoredFrames();
+      setStatus('loading');
+      setStatusText('Frame cache reset · rebuilding in the background…');
+    } finally {
+      setIsResettingCache(false);
+      setCacheGeneration((value) => value + 1);
+      setLand(flattenFeatures(baseLand));
+      setAge(0);
+    }
+  };
 
   const focus = (lat, lng, altitude = 1.7) => {
     globeRef.current?.pointOfView({ lat, lng, altitude }, reducedMotion ? 0 : 850);
@@ -559,7 +602,7 @@ function App() {
       <section className="timeline" aria-label="Geological timeline">
         <div className="timeline-header">
           <div><div className="panel-eyebrow">Geological time</div><strong>{direction}</strong></div>
-          <div className="timeline-readout"><span>{shortAge(age)}</span><small>NOW ← left · 1.8 Ga · right →</small></div>
+          <div className="timeline-readout"><span>{shortAge(age)}</span><small>1.8 Ga ← · NOW →</small></div>
         </div>
 
         <div className="slider-wrap">
@@ -569,7 +612,7 @@ function App() {
               <button key={event.id} className="timeline-event" style={{ left: (event.ma / 1800 * 100) + '%' }} onClick={() => jumpToEvent(event)} title={event.name + ' — ' + shortAge(event.ma)} aria-label={'Jump to ' + event.name} />
             ))}
           </div>
-          <div className="timeline-labels" aria-hidden="true"><span>NOW</span><span>250 Ma</span><span>500 Ma</span><span>1 Ga</span><span>1.5 Ga</span><span>1.8 Ga</span></div>
+          <div className="timeline-labels" aria-hidden="true"><span>1.8 Ga</span><span>1.5 Ga</span><span>1 Ga</span><span>500 Ma</span><span>250 Ma</span><span>NOW</span></div>
         </div>
 
         <div className="timeline-actions">
