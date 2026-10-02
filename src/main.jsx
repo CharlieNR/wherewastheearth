@@ -11,6 +11,142 @@ const DAY_TEXTURE = 'https://unpkg.com/three-globe/example/img/earth-blue-marble
 const BUMP_TEXTURE = 'https://unpkg.com/three-globe/example/img/earth-topology.png';
 const STAR_TEXTURE = 'https://unpkg.com/three-globe/example/img/night-sky.png';
 
+const CACHE_DB_NAME = 'intheglobe-frame-cache-v2';
+const CACHE_STORE_NAME = 'frames';
+const CACHE_MANIFEST_KEY = 'intheglobe-frame-manifest-v2';
+const MAX_AGE = 1800;
+const FRAME_STEP = 5;
+const FRAME_AGES = Array.from({ length: Math.floor(MAX_AGE / FRAME_STEP) + 1 }, (_, index) => index * FRAME_STEP);
+
+function frameKey(age) {
+  return modelForAge(age) + ':' + String(Math.round(age));
+}
+
+function readFrameManifest() {
+  try {
+    const value = JSON.parse(window.localStorage.getItem(CACHE_MANIFEST_KEY) || '{}');
+    return new Set(Object.keys(value));
+  } catch {
+    return new Set();
+  }
+}
+
+function writeFrameManifestEntry(key) {
+  try {
+    const current = JSON.parse(window.localStorage.getItem(CACHE_MANIFEST_KEY) || '{}');
+    current[key] = 1;
+    window.localStorage.setItem(CACHE_MANIFEST_KEY, JSON.stringify(current));
+  } catch {
+    // localStorage can be unavailable or full; IndexedDB remains the durable frame store.
+  }
+}
+
+function openFrameDb() {
+  if (!('indexedDB' in window)) return Promise.resolve(null);
+  return new Promise((resolve, reject) => {
+    const request = window.indexedDB.open(CACHE_DB_NAME, 1);
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains(CACHE_STORE_NAME)) {
+        request.result.createObjectStore(CACHE_STORE_NAME, { keyPath: 'key' });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function getStoredFrame(age) {
+  const key = frameKey(age);
+  const db = await openFrameDb().catch(() => null);
+  if (!db) return null;
+  return new Promise((resolve) => {
+    const transaction = db.transaction(CACHE_STORE_NAME, 'readonly');
+    const request = transaction.objectStore(CACHE_STORE_NAME).get(key);
+    request.onsuccess = async () => {
+      const record = request.result;
+      if (!record) {
+        resolve(null);
+        return;
+      }
+      try {
+        if (record.encoding === 'gzip' && typeof DecompressionStream === 'function') {
+          const stream = new Blob([record.data]).stream().pipeThrough(new DecompressionStream('gzip'));
+          const json = await new Response(stream).text();
+          resolve(JSON.parse(json));
+          return;
+        }
+        resolve(typeof record.data === 'string' ? JSON.parse(record.data) : null);
+      } catch (error) {
+        console.warn('Could not decode cached reconstruction frame ' + key, error);
+        resolve(null);
+      }
+    };
+    request.onerror = () => resolve(null);
+  });
+}
+
+async function putStoredFrame(age, features) {
+  const key = frameKey(age);
+  const compactFeatures = features.map((feature) => ({
+    type: 'Feature',
+    properties: {},
+    geometry: feature.geometry,
+  }));
+  const json = JSON.stringify(compactFeatures);
+  let encoding = 'json';
+  let data = json;
+
+  if (typeof CompressionStream === 'function') {
+    try {
+      const stream = new Blob([json]).stream().pipeThrough(new CompressionStream('gzip'));
+      data = await new Response(stream).arrayBuffer();
+      encoding = 'gzip';
+    } catch {
+      encoding = 'json';
+      data = json;
+    }
+  }
+
+  const db = await openFrameDb().catch(() => null);
+  if (db) {
+    await new Promise((resolve) => {
+      const transaction = db.transaction(CACHE_STORE_NAME, 'readwrite');
+      transaction.objectStore(CACHE_STORE_NAME).put({ key, age, model: modelForAge(age), encoding, data, savedAt: Date.now() });
+      transaction.oncomplete = resolve;
+      transaction.onerror = resolve;
+    });
+    writeFrameManifestEntry(key);
+  }
+  return compactFeatures;
+}
+
+async function fetchReconstructionFrame(age, baseLand, signal) {
+  const payload = new URLSearchParams();
+  payload.set('feature_collection', JSON.stringify({
+    type: 'FeatureCollection',
+    features: [{ type: 'Feature', properties: {}, geometry: baseLand.geometry }],
+  }));
+  payload.set('time', String(age));
+  payload.set('model', modelForAge(age));
+  payload.set('anchor_plate_id', '0');
+
+  const response = await fetch(GPLATES_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+    body: payload,
+    signal,
+  });
+  if (!response.ok) throw new Error('GPlates responded with ' + response.status);
+  const reconstructed = await response.json();
+  const features = flattenFeatures(reconstructed).filter((feature) => feature.geometry).map((feature) => ({
+    type: 'Feature',
+    properties: {},
+    geometry: feature.geometry,
+  }));
+  if (!features.length) throw new Error('No reconstructed geometry returned');
+  return features;
+}
+
 function modelForAge(age) {
   if (age <= 410) return 'MULLER2022';
   if (age <= 1000) return 'MERDITH2021';
@@ -63,6 +199,8 @@ function App() {
   const [eventMode, setEventMode] = useState(true);
   const [autoRotate, setAutoRotate] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [cacheProgress, setCacheProgress] = useState({ cached: 0, total: FRAME_AGES.length });
+  const frameCacheRef = useRef(new Map());
   const [reducedMotion, setReducedMotion] = useState(
     window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false
   );
@@ -112,49 +250,111 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (!baseLand) return;
+    let cancelled = false;
+
+    const warm = async () => {
+      const manifest = readFrameManifest();
+      let cached = manifest.size;
+      setCacheProgress({ cached: Math.min(cached + (manifest.has(frameKey(0)) ? 0 : 1), FRAME_AGES.length), total: FRAME_AGES.length });
+
+      const queue = FRAME_AGES.filter((frameAge) => frameAge > 0 && !manifest.has(frameKey(frameAge)));
+      let cursor = 0;
+
+      const worker = async () => {
+        while (!cancelled) {
+          const index = cursor++;
+          if (index >= queue.length) return;
+          const frameAge = queue[index];
+          const key = frameKey(frameAge);
+
+          try {
+            let features = frameCacheRef.current.get(key);
+            if (!features) features = await getStoredFrame(frameAge);
+
+            if (!features) {
+              features = await fetchReconstructionFrame(frameAge, baseLand);
+              if (cancelled) return;
+              await putStoredFrame(frameAge, features);
+            }
+
+            frameCacheRef.current.set(key, features);
+            cached += 1;
+            setCacheProgress({ cached: Math.min(cached, FRAME_AGES.length), total: FRAME_AGES.length });
+          } catch (error) {
+            console.warn('Background frame preload failed for ' + shortAge(frameAge), error);
+          }
+
+          await new Promise((resolve) => window.setTimeout(resolve, 35));
+        }
+      };
+
+      await Promise.all([worker(), worker()]);
+    };
+
+    const idle = window.requestIdleCallback
+      ? window.requestIdleCallback(() => warm(), { timeout: 1200 })
+      : window.setTimeout(warm, 700);
+
+    return () => {
+      cancelled = true;
+      if (window.cancelIdleCallback && typeof idle === 'number') window.cancelIdleCallback(idle);
+      else window.clearTimeout(idle);
+    };
+  }, [baseLand]);
+
+  useEffect(() => {
     if (!baseLand || status === 'error') return;
     const currentRequest = ++requestRef.current;
+    const controller = new AbortController();
+    const targetAge = Math.round(age);
+    const delay = isPlaying ? 0 : reducedMotion ? 40 : 180;
+
     const timer = window.setTimeout(async () => {
       if (age < 0.05) {
+        frameCacheRef.current.set(frameKey(0), flattenFeatures(baseLand));
         setLand(flattenFeatures(baseLand));
         setStatus('ready');
-        setStatusText('Present day reference');
+        setStatusText('Present day reference · local frame');
         return;
       }
-      setStatus('loading');
-      setStatusText('Reconstructing ' + shortAge(age) + '…');
-      try {
-        const payload = new URLSearchParams();
-        payload.set('feature_collection', JSON.stringify({
-          type: 'FeatureCollection',
-          features: [{ type: 'Feature', properties: {}, geometry: baseLand.geometry }],
-        }));
-        payload.set('time', String(age));
-        payload.set('model', modelForAge(age));
-        payload.set('anchor_plate_id', '0');
 
-        const response = await fetch(GPLATES_URL, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
-          body: payload,
-        });
-        if (!response.ok) throw new Error('GPlates responded with ' + response.status);
-        const reconstructed = await response.json();
-        const features = flattenFeatures(reconstructed).filter((feature) => feature.geometry);
-        if (!features.length) throw new Error('No reconstructed geometry returned');
+      const key = frameKey(targetAge);
+      try {
+        setStatus('loading');
+        setStatusText('Loading ' + shortAge(targetAge) + ' from the local frame cache…');
+
+        let features = frameCacheRef.current.get(key);
+        if (!features) {
+          features = await getStoredFrame(targetAge);
+          if (features) frameCacheRef.current.set(key, features);
+        }
+
+        if (!features) {
+          setStatusText('Caching ' + shortAge(targetAge) + ' reconstruction…');
+          features = await fetchReconstructionFrame(targetAge, baseLand, controller.signal);
+          if (currentRequest !== requestRef.current) return;
+          frameCacheRef.current.set(key, features);
+          await putStoredFrame(targetAge, features);
+        }
+
         if (currentRequest !== requestRef.current) return;
         setLand(features);
         setStatus('ready');
-        setStatusText(shortAge(age) + ' reconstruction');
+        setStatusText(shortAge(targetAge) + ' reconstruction · cached locally');
       } catch (error) {
-        if (currentRequest !== requestRef.current) return;
+        if (currentRequest !== requestRef.current || error?.name === 'AbortError') return;
         console.warn('Reconstruction unavailable; keeping last valid geometry.', error);
         setStatus('warning');
-        setStatusText('Live reconstruction unavailable — keeping the last valid view');
+        setStatusText('Frame unavailable — keeping the last valid view');
       }
-    }, reducedMotion ? 60 : 260);
-    return () => window.clearTimeout(timer);
-  }, [age, baseLand, reducedMotion, status]);
+    }, delay);
+
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [age, baseLand, isPlaying, reducedMotion, status]);
 
   useEffect(() => {
     if (!globeRef.current) return;
@@ -172,9 +372,9 @@ function App() {
     if (!isPlaying) return;
     const interval = window.setInterval(() => {
       setAge((previous) => {
-        const next = Math.min(1800, previous + (previous < 500 ? 3 : 8));
+        const next = Math.min(MAX_AGE, previous + FRAME_STEP);
         setDirection(next > previous ? 'Into the past' : 'At the deep-time boundary');
-        if (next >= 1800) setIsPlaying(false);
+        if (next >= MAX_AGE) setIsPlaying(false);
         return next;
       });
     }, reducedMotion ? 320 : 180);
@@ -231,7 +431,7 @@ function App() {
           <div><div className="brand-name">intheglobe</div><div className="brand-sub">where was the Earth?</div></div>
         </div>
         <div className="header-status">
-          <div className="status-dot" data-status={status} /><span>{statusText}</span><span className="status-divider">·</span><span>model {modelForAge(age)}</span>
+          <div className="status-dot" data-status={status} /><span>{statusText}</span><span className="status-divider">·</span><span>model {modelForAge(age)}</span><span className="status-divider">·</span><span>frames {cacheProgress.cached}/{cacheProgress.total}</span>
         </div>
         <button className="present-button" onClick={() => handleAge(0)}><span aria-hidden="true">↻</span> Present day</button>
       </header>
@@ -359,11 +559,11 @@ function App() {
       <section className="timeline" aria-label="Geological timeline">
         <div className="timeline-header">
           <div><div className="panel-eyebrow">Geological time</div><strong>{direction}</strong></div>
-          <div className="timeline-readout"><span>{shortAge(age)}</span><small>0 → 1.8 billion years</small></div>
+          <div className="timeline-readout"><span>{shortAge(age)}</span><small>NOW ← left · 1.8 Ga · right →</small></div>
         </div>
 
         <div className="slider-wrap">
-          <input type="range" min="0" max="1800" step="1" value={age} onChange={(event) => handleAge(event.target.value)} aria-label="Travel through geological time" />
+          <input type="range" min="0" max={MAX_AGE} step="1" value={age} onChange={(event) => handleAge(event.target.value)} aria-label="Travel through geological time" />
           <div className="timeline-track" aria-hidden="true">
             {EVENTS.map((event) => (
               <button key={event.id} className="timeline-event" style={{ left: (event.ma / 1800 * 100) + '%' }} onClick={() => jumpToEvent(event)} title={event.name + ' — ' + shortAge(event.ma)} aria-label={'Jump to ' + event.name} />
@@ -373,7 +573,7 @@ function App() {
         </div>
 
         <div className="timeline-actions">
-          <button className="play-button" onClick={() => setIsPlaying((value) => !value)}><span aria-hidden="true">{isPlaying ? 'Ⅱ' : '▶'}</span>{isPlaying ? 'Pause journey' : 'Animate journey'}</button>
+          <button className="play-button" onClick={() => setIsPlaying((value) => !value)} aria-label={isPlaying ? 'Pause geological time playback' : 'Play the locally cached geological time sequence'}><span aria-hidden="true">{isPlaying ? 'Ⅱ' : '▶'}</span>{isPlaying ? 'Pause journey' : 'Animate journey'}</button>
           <label className="toggle">
             <input type="checkbox" checked={reducedMotion} onChange={(event) => setReducedMotion(event.target.checked)} />
             <span className="toggle-track" /><span>Reduce motion</span>
