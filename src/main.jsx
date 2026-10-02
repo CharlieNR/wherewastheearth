@@ -472,6 +472,7 @@ function App() {
       diagnostic('info', 'CACHE', 'Cache inventory checked', { cached, total: KEYFRAME_AGES.length, missing: KEYFRAME_AGES.length - cached });
 
       const missing = KEYFRAME_AGES.filter((frameAge) => !storedKeys.has(frameKey(frameAge)));
+      let cursor = 0;
       const retryQueue = [];
       const retryCounts = new Map();
       const ordered = [...missing].sort((a, b) => {
@@ -638,6 +639,7 @@ function App() {
 
   const resetFrames = async () => {
     if (isResettingCache) return;
+    diagnostic('warn', 'UI', 'User requested cache reset');
     setIsResettingCache(true);
     setIsPlaying(false);
     cacheGenerationRef.current += 1;
@@ -707,7 +709,13 @@ function App() {
           <div className="status-dot" data-status={status} /><span>{statusText}</span><span className="status-divider">·</span><span>model {modelForAge(age)}</span><span className="status-divider">·</span><span>keyframes {cacheProgress.cached}/{cacheProgress.total}</span>
         </div>
         <div className="header-actions">
-          <button className="diagnostics-button" onClick={() => setTerminalOpen((value) => !value)} aria-expanded={terminalOpen} aria-label="Open diagnostics terminal" title="Open diagnostics terminal">🌐<span>Terminal</span></button>
+          <button className="diagnostics-button" onClick={() => {
+            setTerminalOpen((value) => {
+              const next = !value;
+              diagnostic('info', 'UI', next ? 'Diagnostics terminal opened' : 'Diagnostics terminal closed', { age, keyframe: keyframeAge, cache: cacheProgress.cached + '/' + cacheProgress.total });
+              return next;
+            });
+          }} aria-expanded={terminalOpen} aria-label="Open diagnostics terminal" title="Open diagnostics terminal"><span className="globe-icon" aria-hidden="true">🌐</span><span>Terminal</span></button>
           <button className="present-button" onClick={() => handleAge(0)}><span aria-hidden="true">↻</span> Present day</button>
         </div>
       </header>
@@ -715,15 +723,20 @@ function App() {
       {terminalOpen && (
         <div className="diagnostics-terminal" role="dialog" aria-label="intheglobe diagnostics terminal">
           <div className="terminal-head">
-            <div><strong>intheglobe / diagnostics</strong><span>live runtime log · {diagnosticLines.length} lines</span></div>
+            <div>
+              <strong>intheglobe / diagnostics</strong>
+              <span>live runtime log · {diagnosticLines.length} lines · current {shortAge(age)} · keyframe {shortAge(keyframeAge)}</span>
+            </div>
             <div className="terminal-tools">
-              <button onClick={() => navigator.clipboard?.writeText(diagnosticLines.join('\\n'))}>Copy</button>
-              <button onClick={() => setDiagnosticLines(['--- log cleared ---'])}>Clear</button>
+              <button onClick={() => navigator.clipboard?.writeText(diagnosticLines.join('\\n')).then(() => diagnostic('info','UI','Diagnostic log copied'))}>Copy</button>
+              <button onClick={() => setDiagnosticLines(['--- log cleared ---', new Date().toISOString().slice(11, 23) + ' INFO  [SYSTEM] Log cleared by user.'])}>Clear</button>
+              <button onClick={() => diagnostic('info','SYSTEM','Runtime snapshot', { age, keyframeAge, model: modelForAge(keyframeAge), cache: cacheProgress.cached + '/' + cacheProgress.total, online: navigator.onLine, indexedDB: 'indexedDB' in window, viewport: window.innerWidth + 'x' + window.innerHeight })}>Snapshot</button>
               <button onClick={() => setTerminalOpen(false)} aria-label="Close diagnostics terminal">×</button>
             </div>
           </div>
           <pre className="terminal-body">{diagnosticLines.join('\\n')}</pre>
-          <div className="terminal-foot"><span>HTTP · CACHE · FRAME · WORLD · UI · WINDOW</span><span>Press Terminal again to close</span></div>
+          <div className="terminal-input"><span>&gt;</span><span>Live diagnostics only — requests, retries, cache hits/misses, cancellations, and browser errors are logged above.</span></div>
+          <div className="terminal-foot"><span>HTTP · CACHE · FRAME · WORLD · UI · WINDOW</span><span>Current model: {modelForAge(keyframeAge)} · Cache: {cacheProgress.cached}/{cacheProgress.total}</span></div>
         </div>
       )}
 
