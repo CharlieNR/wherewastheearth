@@ -389,3 +389,25 @@ html[data-reduced-motion='true'] *, html[data-reduced-motion='true'] *::before, 
 
 /* Clear geological layers and playback */
 .play-button:disabled { cursor: default; opacity: .48; }
+
+
+.country-panel { padding: 11px; }
+.country-search-box { display: flex; align-items: center; gap: 7px; padding: 9px 10px; border: 1px solid var(--line); border-radius: 11px; background: rgba(0,0,0,.13); }
+.country-search-box > span { color: var(--soft); }
+.country-search-box input { flex: 1; min-width: 0; background: none; border: 0; outline: 0; color: var(--text); font-size: 11px; }
+.country-search-box input::placeholder { color: #6f8b80; }
+.country-search-box button { border: 0; background: none; color: var(--soft); cursor: pointer; padding: 0 1px; }
+.country-results { display: grid; gap: 3px; margin-top: 7px; max-height: 230px; overflow: auto; }
+.country-result { display: grid; grid-template-columns: auto minmax(0,1fr) auto; gap: 8px; align-items: center; width: 100%; padding: 8px; border: 1px solid transparent; border-radius: 9px; background: transparent; text-align: left; cursor: pointer; color: var(--text); }
+.country-result:hover, .country-result:focus-visible { background: rgba(255,92,175,.08); border-color: rgba(255,92,175,.3); outline: none; }
+.country-flag { color: #ff5caf; font-size: 9px; }
+.country-result > span:nth-child(2) { min-width: 0; display: grid; gap: 2px; }
+.country-result strong { font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.country-result small { color: var(--soft); font-size: 8px; }
+.country-result > span:last-child { color: var(--muted); font-size: 13px; }
+.tracked-country-status { display: flex; gap: 9px; align-items: center; margin-top: 8px; padding: 9px; border: 1px solid rgba(255,92,175,.22); border-radius: 10px; background: rgba(255,92,175,.07); }
+.tracked-country-swatch { width: 11px; height: 11px; flex: 0 0 auto; border-radius: 3px; background: #ff5caf; box-shadow: 0 0 12px rgba(255,92,175,.45); }
+.tracked-country-status > div { min-width: 0; display: grid; gap: 2px; }
+.tracked-country-status small { color: #ffb9dc; font-size: 7px; font-weight: 900; letter-spacing: .12em; }
+.tracked-country-status strong { font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tracked-country-status span:last-child { color: var(--muted); font-size: 8px; }
