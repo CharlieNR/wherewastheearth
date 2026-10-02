@@ -219,6 +219,9 @@ function App() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [cacheProgress, setCacheProgress] = useState({ cached: 0, total: FRAME_AGES.length });
   const frameCacheRef = useRef(new Map());
+  const preloadControllersRef = useRef(new Set());
+  const foregroundRequestRef = useRef(0);
+  const foregroundLoadingRef = useRef(false);
   const cacheGenerationRef = useRef(0);
   const [cacheGeneration, setCacheGeneration] = useState(0);
   const [isResettingCache, setIsResettingCache] = useState(false);
@@ -291,15 +294,22 @@ function App() {
           const index = cursor++;
           if (index >= missing.length) return;
 
+          while (!cancelled && generation === cacheGenerationRef.current && foregroundLoadingRef.current) {
+            await new Promise((resolve) => window.setTimeout(resolve, 40));
+          }
+          if (cancelled || generation !== cacheGenerationRef.current) return;
+
           const frameAge = missing[index];
           const key = frameKey(frameAge);
+          const preloadController = new AbortController();
+          preloadControllersRef.current.add(preloadController);
 
           try {
             let features = frameCacheRef.current.get(key);
             if (!features) features = await getStoredFrame(frameAge);
 
             if (!features) {
-              features = await fetchReconstructionFrame(frameAge, baseLand);
+              features = await fetchReconstructionFrame(frameAge, baseLand, preloadController.signal);
               if (cancelled || generation !== cacheGenerationRef.current) return;
               await putStoredFrame(frameAge, features);
             }
@@ -309,7 +319,11 @@ function App() {
             cached += 1;
             setCacheProgress({ cached: Math.min(cached, FRAME_AGES.length), total: FRAME_AGES.length });
           } catch (error) {
-            console.warn('Background frame preload failed for ' + shortAge(frameAge), error);
+            if (error?.name !== 'AbortError') {
+              console.warn('Background frame preload failed for ' + shortAge(frameAge), error);
+            }
+          } finally {
+            preloadControllersRef.current.delete(preloadController);
           }
         }
       };
@@ -334,11 +348,17 @@ function App() {
     const delay = isPlaying ? 0 : reducedMotion ? 40 : 180;
 
     const timer = window.setTimeout(async () => {
+      foregroundLoadingRef.current = true;
+      const foregroundRequestId = ++foregroundRequestRef.current;
+      for (const controller of preloadControllersRef.current) controller.abort();
+      preloadControllersRef.current.clear();
+
       if (age < 0.05) {
         frameCacheRef.current.set(frameKey(0), flattenFeatures(baseLand));
         setLand(flattenFeatures(baseLand));
         setStatus('ready');
-        setStatusText('Present day reference · local frame');
+        setStatusText('Present day reference · local frame · cache resumed');
+        if (foregroundRequestRef.current === foregroundRequestId) foregroundLoadingRef.current = false;
         return;
       }
 
@@ -364,12 +384,16 @@ function App() {
         if (currentRequest !== requestRef.current) return;
         setLand(features);
         setStatus('ready');
-        setStatusText(shortAge(targetAge) + ' reconstruction · cached locally');
+        setStatusText(shortAge(targetAge) + ' reconstruction · cache resumed');
       } catch (error) {
         if (currentRequest !== requestRef.current || error?.name === 'AbortError') return;
         console.warn('Reconstruction unavailable; keeping last valid geometry.', error);
         setStatus('warning');
         setStatusText('Frame unavailable — keeping the last valid view');
+      } finally {
+        if (foregroundRequestRef.current === foregroundRequestId) {
+          foregroundLoadingRef.current = false;
+        }
       }
     }, delay);
 
@@ -617,6 +641,7 @@ function App() {
 
         <div className="timeline-actions">
           <button className="play-button" onClick={() => setIsPlaying((value) => !value)} aria-label={isPlaying ? 'Pause geological time playback' : 'Play the locally cached geological time sequence'}><span aria-hidden="true">{isPlaying ? 'Ⅱ' : '▶'}</span>{isPlaying ? 'Pause journey' : 'Animate journey'}</button>
+          <button className="reset-button" onClick={resetFrames} disabled={isResettingCache} aria-label="Reset all locally cached geological frames"><span aria-hidden="true">↺</span>{isResettingCache ? 'Resetting…' : 'Reset frames'}</button>
           <label className="toggle">
             <input type="checkbox" checked={reducedMotion} onChange={(event) => setReducedMotion(event.target.checked)} />
             <span className="toggle-track" /><span>Reduce motion</span>
