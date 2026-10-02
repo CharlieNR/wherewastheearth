@@ -288,6 +288,7 @@ function App() {
       // then continue through the rest of deep time.
       missing.sort((a, b) => a - b);
       let cursor = 0;
+      const retryQueue = [];
 
       const worker = async () => {
         while (!cancelled && generation === cacheGenerationRef.current) {
@@ -299,7 +300,6 @@ function App() {
           }
           if (cancelled || generation !== cacheGenerationRef.current) return;
 
-          const frameAge = missing[index];
           const key = frameKey(frameAge);
           const preloadController = new AbortController();
           preloadControllersRef.current.add(preloadController);
@@ -319,7 +319,9 @@ function App() {
             cached += 1;
             setCacheProgress({ cached: Math.min(cached, FRAME_AGES.length), total: FRAME_AGES.length });
           } catch (error) {
-            if (error?.name !== 'AbortError') {
+            if (error?.name === 'AbortError' && !cancelled && generation === cacheGenerationRef.current) {
+              retryQueue.push(frameAge);
+            } else if (error?.name !== 'AbortError') {
               console.warn('Background frame preload failed for ' + shortAge(frameAge), error);
             }
           } finally {
@@ -345,7 +347,7 @@ function App() {
     const currentRequest = ++requestRef.current;
     const controller = new AbortController();
     const targetAge = Math.round(age);
-    const delay = isPlaying ? 0 : reducedMotion ? 40 : 180;
+    const delay = isPlaying ? 0 : reducedMotion ? 20 : 0;
 
     const timer = window.setTimeout(async () => {
       foregroundLoadingRef.current = true;
