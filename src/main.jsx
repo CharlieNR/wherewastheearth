@@ -18,6 +18,9 @@ const MAX_AGE = 1800;
 const FRAME_STEP = 5;
 const FRAME_AGES = Array.from({ length: Math.floor(MAX_AGE / FRAME_STEP) + 1 }, (_, index) => index * FRAME_STEP);
 const PRELOAD_WORKERS = 6;
+const FRAME_REQUEST_TIMEOUT_MS = 45000;
+const FRAME_REQUEST_RETRIES = 3;
+const PRIORITY_PRELOAD_COUNT = 36;
 
 function frameKey(age) {
   return modelForAge(age) + ':' + String(Math.round(age));
@@ -138,6 +141,50 @@ async function clearStoredFrames() {
   }
 }
 
+
+function sleep(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+async function fetchWithTimeout(url, options = {}) {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), FRAME_REQUEST_TIMEOUT_MS);
+  const combinedSignal = options.signal;
+  let abortHandler;
+
+  if (combinedSignal) {
+    if (combinedSignal.aborted) {
+      controller.abort();
+    } else {
+      abortHandler = () => controller.abort();
+      combinedSignal.addEventListener('abort', abortHandler, { once: true });
+    }
+  }
+
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    window.clearTimeout(timeout);
+    if (combinedSignal && abortHandler) combinedSignal.removeEventListener('abort', abortHandler);
+  }
+}
+
+async function fetchReconstructionWithRetry(age, baseLand, signal) {
+  let lastError;
+  for (let attempt = 1; attempt <= FRAME_REQUEST_RETRIES; attempt += 1) {
+    if (signal?.aborted) throw new DOMException('Request aborted', 'AbortError');
+    try {
+      return await fetchReconstructionFrame(age, baseLand, signal);
+    } catch (error) {
+      lastError = error;
+      if (error?.name === 'AbortError') throw error;
+      console.warn('Frame ' + shortAge(age) + ' attempt ' + attempt + '/' + FRAME_REQUEST_RETRIES + ' failed.', error);
+      if (attempt < FRAME_REQUEST_RETRIES) await sleep(250 * attempt);
+    }
+  }
+  throw lastError || new Error('Frame request failed');
+}
+
 async function fetchReconstructionFrame(age, baseLand, signal) {
   const payload = new URLSearchParams();
   payload.set('feature_collection', JSON.stringify({
@@ -148,7 +195,7 @@ async function fetchReconstructionFrame(age, baseLand, signal) {
   payload.set('model', modelForAge(age));
   payload.set('anchor_plate_id', '0');
 
-  const response = await fetch(GPLATES_URL, {
+  const response = await fetchWithTimeout(GPLATES_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
     body: payload,
@@ -289,14 +336,22 @@ function App() {
       missing.sort((a, b) => a - b);
       let cursor = 0;
       const retryQueue = [];
+      const ordered = [...missing].sort((a, b) => {
+        const aPriority = a <= PRIORITY_PRELOAD_COUNT * FRAME_STEP ? 0 : 1;
+        const bPriority = b <= PRIORITY_PRELOAD_COUNT * FRAME_STEP ? 0 : 1;
+        return aPriority - bPriority || a - b;
+      });
 
       const worker = async () => {
         while (!cancelled && generation === cacheGenerationRef.current) {
-          const index = cursor++;
-          if (index >= missing.length) return;
+          let frameAge = retryQueue.shift();
+          if (frameAge === undefined) {
+            frameAge = ordered[cursor++];
+          }
+          if (frameAge === undefined) return;
 
           while (!cancelled && generation === cacheGenerationRef.current && foregroundLoadingRef.current) {
-            await new Promise((resolve) => window.setTimeout(resolve, 40));
+            await sleep(40);
           }
           if (cancelled || generation !== cacheGenerationRef.current) return;
 
@@ -309,7 +364,7 @@ function App() {
             if (!features) features = await getStoredFrame(frameAge);
 
             if (!features) {
-              features = await fetchReconstructionFrame(frameAge, baseLand, preloadController.signal);
+              features = await fetchReconstructionWithRetry(frameAge, baseLand, preloadController.signal);
               if (cancelled || generation !== cacheGenerationRef.current) return;
               await putStoredFrame(frameAge, features);
             }
@@ -323,6 +378,8 @@ function App() {
               retryQueue.push(frameAge);
             } else if (error?.name !== 'AbortError') {
               console.warn('Background frame preload failed for ' + shortAge(frameAge), error);
+              // Retry once more later rather than losing the frame from the cache.
+              retryQueue.push(frameAge);
             }
           } finally {
             preloadControllersRef.current.delete(preloadController);
@@ -376,8 +433,8 @@ function App() {
         }
 
         if (!features) {
-          setStatusText('Caching ' + shortAge(targetAge) + ' reconstruction…');
-          features = await fetchReconstructionFrame(targetAge, baseLand, controller.signal);
+          setStatusText('Loading ' + shortAge(targetAge) + ' reconstruction…');
+          features = await fetchReconstructionWithRetry(targetAge, baseLand, controller.signal);
           if (currentRequest !== requestRef.current) return;
           frameCacheRef.current.set(key, features);
           await putStoredFrame(targetAge, features);
@@ -389,9 +446,9 @@ function App() {
         setStatusText(shortAge(targetAge) + ' reconstruction · cache resumed');
       } catch (error) {
         if (currentRequest !== requestRef.current || error?.name === 'AbortError') return;
-        console.warn('Reconstruction unavailable; keeping last valid geometry.', error);
+        console.warn('Reconstruction unavailable after retries; keeping last valid geometry.', error);
         setStatus('warning');
-        setStatusText('Frame unavailable — keeping the last valid view');
+        setStatusText(shortAge(targetAge) + ' could not be loaded — retry by scrubbing again');
       } finally {
         if (foregroundRequestRef.current === foregroundRequestId) {
           foregroundLoadingRef.current = false;
