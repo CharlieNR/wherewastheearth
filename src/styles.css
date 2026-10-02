@@ -267,7 +267,7 @@ button { color: inherit; }
   .terminal-body { color: #ffffff; }
   .terminal-input > span:first-child { color: #ffffff; }
 }
-@media (max-width: 600px) { .header-actions { gap: 5px; } .diagnostics-button span:last-child { display: none; } .diagnostics-terminal { top: 70px; right: 10px; width: calc(100vw - 20px); height: 72vh; min-height: 280px; } .terminal-tools button { padding: 5px 6px; } .terminal-body { font-size: 8px; } }
+@media (max-width: 600px) { .header-actions { gap: 5px; } .diagnostics-terminal { top: 70px; right: 10px; width: calc(100vw - 20px); height: 72vh; min-height: 280px; } .terminal-tools button { padding: 5px 6px; } .terminal-body { font-size: 8px; } }
 
 .present-button, .play-button { border: 1px solid var(--line-strong); background: rgba(228, 245, 233, 0.08); border-radius: 999px; padding: 9px 13px; cursor: pointer; font-size: 11px; font-weight: 700; transition: transform .2s ease, background .2s ease, border-color .2s ease; }
 .present-button:hover, .play-button:hover { transform: translateY(-1px); background: rgba(228, 245, 233, .13); border-color: rgba(226, 244, 231, .3); }
@@ -386,3 +386,6 @@ html[data-reduced-motion='true'] *, html[data-reduced-motion='true'] *::before, 
   .timeline { padding: 12px 13px; } .timeline-actions { flex-wrap: wrap; } .right-rail { grid-template-columns: 1fr; }
   .facts-panel { grid-column: auto; } .timeline-labels span:nth-child(2), .timeline-labels span:nth-child(4) { display: none; }
 }
+
+/* Clear geological layers and playback */
+.play-button:disabled { cursor: default; opacity: .48; }
