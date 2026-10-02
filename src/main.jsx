@@ -18,7 +18,7 @@ const MAX_AGE = 1800;
 const FRAME_STEP = 5;
 const FRAME_AGES = Array.from({ length: Math.floor(MAX_AGE / FRAME_STEP) + 1 }, (_, index) => index * FRAME_STEP);
 const PRELOAD_WORKERS = 6;
-const FRAME_REQUEST_TIMEOUT_MS = 45000;
+const FRAME_REQUEST_TIMEOUT_MS = 30000;
 const FRAME_REQUEST_RETRIES = 3;
 const PRIORITY_PRELOAD_COUNT = 36;
 
@@ -56,6 +56,18 @@ function openFrameDb() {
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
+  });
+}
+
+
+async function getStoredFrameKeys() {
+  const db = await openFrameDb().catch(() => null);
+  if (!db) return new Set();
+  return new Promise((resolve) => {
+    const transaction = db.transaction(CACHE_STORE_NAME, 'readonly');
+    const request = transaction.objectStore(CACHE_STORE_NAME).getAllKeys();
+    request.onsuccess = () => resolve(new Set(request.result || []));
+    request.onerror = () => resolve(new Set());
   });
 }
 
@@ -333,10 +345,11 @@ function App() {
 
     const warm = async () => {
       const manifest = readFrameManifest();
-      let cached = FRAME_AGES.filter((frameAge) => frameAge === 0 || manifest.has(frameKey(frameAge))).length;
+      const storedKeys = await getStoredFrameKeys();
+      let cached = FRAME_AGES.filter((frameAge) => frameAge === 0 || storedKeys.has(frameKey(frameAge))).length;
       setCacheProgress({ cached, total: FRAME_AGES.length });
 
-      const missing = FRAME_AGES.filter((frameAge) => frameAge > 0 && !manifest.has(frameKey(frameAge)));
+      const missing = FRAME_AGES.filter((frameAge) => frameAge > 0 && !storedKeys.has(frameKey(frameAge)));
       // Prioritise the near-present sequence so playback becomes useful quickly,
       // then continue through the rest of deep time.
       missing.sort((a, b) => a - b);
@@ -507,6 +520,8 @@ function App() {
     cacheGenerationRef.current += 1;
     setCacheProgress({ cached: 1, total: FRAME_AGES.length });
     frameCacheRef.current.clear();
+    for (const controller of preloadControllersRef.current) controller.abort();
+    preloadControllersRef.current.clear();
 
     try {
       await clearStoredFrames();
