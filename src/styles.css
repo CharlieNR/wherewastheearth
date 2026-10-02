@@ -121,7 +121,7 @@ button { color: inherit; }
 .timeline-readout span { font-family: 'Manrope', sans-serif; font-size: 13px; }
 .timeline-readout small { color: var(--soft); font-size: 9px; }
 .slider-wrap { position: relative; margin: 12px 4px 0; direction: ltr; }
-.slider-wrap input[type='range'] { position: relative; z-index: 3; width: 100%; appearance: none; background: transparent; }
+.slider-wrap input[type='range'] { position: relative; z-index: 3; width: 100%; appearance: none; background: transparent; direction: rtl; }
 .slider-wrap input[type='range']::-webkit-slider-runnable-track { height: 4px; background: rgba(230,245,234,.12); border-radius: 999px; }
 .slider-wrap input[type='range']::-webkit-slider-thumb { appearance: none; width: 16px; height: 16px; margin-top: -6px; border-radius: 50%; border: 3px solid #0b3328; background: var(--lime); box-shadow: 0 0 0 4px rgba(217,245,200,.08), 0 0 18px rgba(217,245,200,.28); cursor: pointer; }
 .slider-wrap input[type='range']::-moz-range-track { height: 4px; background: rgba(230,245,234,.12); border-radius: 999px; }
@@ -132,6 +132,10 @@ button { color: inherit; }
 .timeline-actions { display: flex; align-items: center; gap: 12px; margin-top: 11px; }
 .play-button { display: inline-flex; align-items: center; gap: 7px; padding: 7px 10px; font-size: 10px; }
 .play-button span { color: var(--mint); }
+.reset-button { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line); background: rgba(228,245,233,.05); color: var(--soft); border-radius: 999px; padding: 7px 10px; cursor: pointer; font-size: 10px; transition: transform .2s ease, background .2s ease, border-color .2s ease, opacity .2s ease; }
+.reset-button:hover:not(:disabled) { transform: translateY(-1px); background: rgba(228,245,233,.09); border-color: var(--line-strong); color: var(--text); }
+.reset-button:disabled { cursor: wait; opacity: .55; }
+.reset-button span { color: var(--warm); }
 .toggle { display: inline-flex; align-items: center; gap: 8px; color: var(--soft); font-size: 9px; cursor: pointer; }
 .toggle input { position: absolute; opacity: 0; pointer-events: none; }
 .toggle-track { width: 26px; height: 15px; border-radius: 999px; border: 1px solid var(--line); background: rgba(255,255,255,.05); position: relative; }
